@@ -17,6 +17,7 @@
 
 #include "wuwa_proc.h"
 #include "wuwa_safe_signal.h"
+#include "../hook/wuwa_perf_hbp.h" /* 新增引入内核硬断头文件 */
 
 int do_vaddr_translate(struct socket* sock, void* arg) {
     struct wuwa_addr_translate_cmd cmd;
@@ -878,3 +879,17 @@ int do_get_process_info(struct socket* sock, void __user* arg) {
 
     return 0;
 }
+
+/* 新增：Perf HBP 内核硬件断点通信处理函数 */
+int do_set_perf_hbp(struct socket* sock, void __user* arg) {
+    struct wuwa_hbp_req req;
+    
+    // 从用户态(C++工具)拷贝配置参数到内核态
+    if (copy_from_user(&req, arg, sizeof(req))) {
+        wuwa_err("failed to copy wuwa_hbp_req from user\n");
+        return -EFAULT;
+    }
+
+    // 调用我们在 wuwa_perf_hbp.c 中写的核心注册逻辑
+    return wuwa_install_perf_hbp(&req);
+}}
