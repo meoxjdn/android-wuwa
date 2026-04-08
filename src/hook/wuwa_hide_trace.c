@@ -2,7 +2,8 @@
 #include <linux/kprobes.h>
 #include <linux/sched.h>
 #include <linux/version.h>
-#include "../core/wuwa_kallsyms.h" // 必须引用这个来查找隐藏符号
+/* 直接声明外部函数，无视头文件路径迷宫 */
+extern unsigned long wuwa_kallsyms_lookup_name(const char *name);
 
 /* [新增] 定义函数指针，绕过内核符号导出限制 */
 typedef long (*copy_from_user_nofault_t)(void *dst, const void __user *src, size_t size);
