@@ -2,6 +2,11 @@
 #include <linux/kprobes.h>
 #include <linux/sched.h>
 #include <linux/version.h>
+#include "../core/wuwa_kallsyms.h" // [新增] 使用驱动自带的查找工具
+
+// [新增] 定义函数指针
+typedef long (*copy_from_user_nofault_t)(void *dst, const void __user *src, size_t size);
+static copy_from_user_nofault_t my_copy_from_user_nofault = NULL;
 
 struct proc_status_data {
     struct task_struct *task;
