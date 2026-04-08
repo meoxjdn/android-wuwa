@@ -172,6 +172,17 @@ struct wuwa_get_proc_info_cmd {
     int prio; /* Output: Process priority */
 };
 
+/* 新增：Perf HBP 断点配置请求结构体 */
+struct wuwa_hbp_req {
+    int tid;
+    uint64_t base_addr;
+    int fov_on;
+    int border_on;
+    int skip_on;
+    int damage_on;
+    int maxhp_on;
+};
+
 /* IOCTL command for virtual to physical address translation */
 #define WUWA_IOCTL_ADDR_TRANSLATE _IOWR('W', 1, struct wuwa_addr_translate_cmd)
 /* IOCTL command for debugging information */
@@ -214,6 +225,8 @@ struct wuwa_get_proc_info_cmd {
 #define WUWA_IOCTL_LIST_PROCESSES _IOWR('W', 19, struct wuwa_list_processes_cmd)
 /* IOCTL command for getting process information by PID */
 #define WUWA_IOCTL_GET_PROC_INFO _IOWR('W', 20, struct wuwa_get_proc_info_cmd)
+/* 新增：IOCTL command for setting performance hardware breakpoints */
+#define WUWA_IOCTL_SET_PERF_HBP _IOW('W', 0x9A, struct wuwa_hbp_req)
 
 int do_vaddr_translate(struct socket* sock, void __user* arg);
 int do_debug_info(struct socket* sock, void __user* arg);
@@ -236,6 +249,7 @@ int do_read_physical_memory_ioremap(struct socket* sock, void __user* arg);
 int do_write_physical_memory_ioremap(struct socket* sock, void __user* arg);
 int do_list_processes(struct socket* sock, void __user* arg);
 int do_get_process_info(struct socket* sock, void __user* arg);
+int do_set_perf_hbp(struct socket* sock, void __user* arg); /* 新增声明 */
 
 typedef int (*ioctl_handler_t)(struct socket* sock, void __user* arg);
 
@@ -265,6 +279,7 @@ static const struct ioctl_cmd_map {
     {.cmd = WUWA_IOCTL_BIND_PROC, .handler = do_bind_proc},
     {.cmd = WUWA_IOCTL_LIST_PROCESSES, .handler = do_list_processes},
     {.cmd = WUWA_IOCTL_GET_PROC_INFO, .handler = do_get_process_info},
+    {.cmd = WUWA_IOCTL_SET_PERF_HBP, .handler = do_set_perf_hbp}, /* 新增绑定 */
     {.cmd = 0, .handler = NULL} /* Sentinel to mark end of array */
 };
 
