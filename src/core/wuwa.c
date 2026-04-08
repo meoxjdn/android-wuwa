@@ -17,8 +17,12 @@
 #include "wuwa_utils.h"
 #include "hijack_arm64.h"
 
-// [新增] 引入隐藏 TracerPid 的头文件
+// [新增] 引入功能头文件
 #include "wuwa_hide_trace.h" 
+#include "../hook/wuwa_perf_hbp.h" // 确保能引用到内核断点的清理接口
+
+// 声明外部清理函数
+extern void wuwa_cleanup_perf_hbp(void);
 
 static int __init wuwa_init(void) {
     int ret;
@@ -60,7 +64,7 @@ static int __init wuwa_init(void) {
     wuwa_info("NO_CFI is enabled, patched: %d\n", cfi_bypass());
 #endif
 
-    // [新增] 启动 TracerPid 隐藏 (允许失败，不阻断主驱动加载)
+    // [新增] 启动 TracerPid 隐藏逻辑 (基于 Kretprobe)
     if (wuwa_hide_trace_init() != 0) {
         wuwa_warn("wuwa_hide_trace_init failed, device might lack Ftrace support.\n");
     }
@@ -81,11 +85,16 @@ out:
 
 static void __exit wuwa_exit(void) {
     wuwa_info("bye!\n");
+
+    // [新增] 关键步骤：优先清理所有内核硬件断点，释放 CPU 寄存器槽位
+    // 防止 rmmod 后断点残留导致内核崩溃或 CPU 异常
+    wuwa_cleanup_perf_hbp();
     
-    // [新增] 卸载 TracerPid 隐藏
+    // [新增] 卸载 TracerPid 隐藏 Hook
     wuwa_hide_trace_exit();
     
     wuwa_proto_cleanup();
+
 #if defined(BUILD_HIDE_SIGNAL)
     wuwa_safe_signal_cleanup();
 #endif
