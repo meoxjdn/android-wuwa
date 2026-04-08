@@ -6,8 +6,8 @@
 extern unsigned long wuwa_kallsyms_lookup_name(const char *name);
 
 /* [新增] 定义函数指针，绕过内核符号导出限制 */
-typedef long (*copy_from_user_nofault_t)(void *dst, const void __user *src, size_t size);
-static copy_from_user_nofault_t my_copy_from_user_nofault = NULL;
+typedef long (*copy_from_user_t)(void *dst, const void __user *src, size_t size);
+static copy_from_user_t my_copy_from_user = NULL;
 
 struct proc_status_data {
     struct task_struct *task;
@@ -57,15 +57,15 @@ static struct kretprobe trace_kretprobe = {
 int wuwa_hide_trace_init(void) {
     int err;
 
-    /* 1. 动态查找被隐藏的 copy_from_user_nofault */
-    my_copy_from_user_nofault = (copy_from_user_nofault_t)wuwa_kallsyms_lookup_name("copy_from_user_nofault");
+    /* 1. 动态查找被隐藏的 copy_from_user */
+    my_copy_from_user = (copy_from_user_t)wuwa_kallsyms_lookup_name("copy_from_user");
     
-    if (!my_copy_from_user_nofault) {
-        pr_warn("wuwa: copy_from_user_nofault not found, trying kernel variant...\n");
-        my_copy_from_user_nofault = (copy_from_user_nofault_t)wuwa_kallsyms_lookup_name("copy_from_kernel_nofault");
+    if (!my_copy_from_user) {
+        pr_warn("wuwa: copy_from_user not found, trying kernel variant...\n");
+        my_copy_from_user = (copy_from_user_t)wuwa_kallsyms_lookup_name("copy_from_kernel_nofault");
     }
 
-    if (my_copy_from_user_nofault) {
+    if (my_copy_from_user) {
         pr_info("wuwa: Successfully linked memory copy symbols.\n");
     }
 
