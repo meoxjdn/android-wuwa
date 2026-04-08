@@ -892,4 +892,4 @@ int do_set_perf_hbp(struct socket* sock, void __user* arg) {
 
     // 调用我们在 wuwa_perf_hbp.c 中写的核心注册逻辑
     return wuwa_install_perf_hbp(&req);
-}}
+}
