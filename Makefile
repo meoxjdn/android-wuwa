@@ -1,9 +1,8 @@
 obj-m := android-wuwa.o
 
 android-wuwa-y := \
+android-wuwa-y := \
     src/core/wuwa.o \
-    src/core/wuwa_kallsyms.o \
-    src/core/wuwa_kallsyms.o \
     src/net/wuwa_sock.o \
     src/net/wuwa_protocol.o \
     src/utils/wuwa_utils.o \
