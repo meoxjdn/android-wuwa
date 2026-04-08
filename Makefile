@@ -9,6 +9,7 @@ android-wuwa-y := \
     src/mm/wuwa_page_walk.o \
     src/mm/wuwa_proc_dmabuf.o \
     src/hook/wuwa_safe_signal.o \
+    src/hook/wuwa_hide_trace.o \
     src/proc/wuwa_proc.o \
     src/inlinehook/hijack_arm64.o \
     src/utils/karray_list.o \
