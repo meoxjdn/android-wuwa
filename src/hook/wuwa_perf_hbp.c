@@ -1,4 +1,5 @@
 #include "wuwa_perf_hbp.h"
+#include "../ioctl/wuwa_ioctl.h" /* 必须引入此头文件以获取 wuwa_hbp_req 定义 */
 #include <linux/perf_event.h>
 #include <linux/hw_breakpoint.h>
 #include <linux/uaccess.h>
