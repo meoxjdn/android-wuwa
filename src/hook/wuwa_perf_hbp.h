@@ -3,16 +3,8 @@
 
 #include <linux/types.h>
 
-/* 定义与 C++ 通信的配置结构体 */
-struct wuwa_hbp_req {
-    int tid;
-    uint64_t base_addr;
-    int fov_on;
-    int border_on;
-    int skip_on;
-    int damage_on;
-    int maxhp_on;
-};
+/* 注意：wuwa_hbp_req 的定义已移至 wuwa_ioctl.h，此处仅作前向声明 */
+struct wuwa_hbp_req;
 
 int wuwa_install_perf_hbp(struct wuwa_hbp_req *req);
 void wuwa_cleanup_perf_hbp(void);
