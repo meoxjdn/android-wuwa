@@ -1,97 +1,64 @@
 #include "wuwa_hide_trace.h"
-#include <linux/ftrace.h>
-#include <linux/kallsyms.h>
 #include <linux/kprobes.h>
-#include <linux/seq_file.h>
+#include <linux/sched.h>
 #include <linux/version.h>
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0)
-static unsigned long lookup_name(const char *name) {
-    struct kprobe kp = { .symbol_name = name };
-    unsigned long retval;
-    if (register_kprobe(&kp) < 0) return 0;
-    retval = (unsigned long)kp.addr;
-    unregister_kprobe(&kp);
-    return retval;
-}
-#else
-static unsigned long lookup_name(const char *name) {
-    return kallsyms_lookup_name(name);
-}
-#endif
-
-struct ftrace_hook {
-    const char *name;
-    void *function;
-    void *original;
-    unsigned long address;
-    struct ftrace_ops ops;
+struct proc_status_data {
+    struct task_struct *task;
+    unsigned int orig_ptrace;
 };
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 11, 0)
-#define FTRACE_OPS_FL_RECURSION FTRACE_OPS_FL_RECURSION_SAFE
-#endif
+static int entry_proc_pid_status(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct proc_status_data *data = (struct proc_status_data *)ri->data;
+    struct task_struct *task = NULL;
 
-static void notrace fh_ftrace_thunk(unsigned long ip, unsigned long parent_ip,
-                                    struct ftrace_ops *ops, struct pt_regs *regs) {
-    struct ftrace_hook *hook = container_of(ops, struct ftrace_hook, ops);
-    if (!within_module(parent_ip, THIS_MODULE)) {
 #ifdef CONFIG_ARM64
-        regs->pc = (unsigned long)hook->function;
-#else
-        regs->ip = (unsigned long)hook->function;
+    // ARM64 中，task_struct 是 proc_pid_status 的第4个参数，存放在 x3 寄存器
+    task = (struct task_struct *)regs->regs[3];
 #endif
+
+    if (task) {
+        data->task = task;
+        data->orig_ptrace = task->ptrace;
+        task->ptrace = 0; // 强行置 0，抹除 TracerPid
+    } else {
+        data->task = NULL;
     }
+    return 0;
 }
 
-static asmlinkage int (*orig_proc_pid_status)(struct seq_file *m, struct pid_namespace *ns,
-                                              struct pid *pid, struct task_struct *task);
+static int ret_proc_pid_status(struct kretprobe_instance *ri, struct pt_regs *regs) {
+    struct proc_status_data *data = (struct proc_status_data *)ri->data;
 
-static asmlinkage int hooked_proc_pid_status(struct seq_file *m, struct pid_namespace *ns,
-                                             struct pid *pid, struct task_struct *task) {
-    int ret;
-    unsigned int backup_ptrace;
-    if (!task) return orig_proc_pid_status(m, ns, pid, task);
-
-    /* 核心操作：读取 status 时，强制把 ptrace 标志设为 0 */
-    backup_ptrace = task->ptrace;
-    task->ptrace = 0;
-    ret = orig_proc_pid_status(m, ns, pid, task);
-    task->ptrace = backup_ptrace;
-    
-    return ret;
+    // 恢复原来的值，保证内核状态正常
+    if (data->task) {
+        data->task->ptrace = data->orig_ptrace;
+    }
+    return 0;
 }
 
-static struct ftrace_hook trace_hook = {
-    .name = "proc_pid_status",
-    .function = hooked_proc_pid_status,
-    .original = &orig_proc_pid_status,
+static struct kretprobe trace_kretprobe = {
+    .handler = ret_proc_pid_status,
+    .entry_handler = entry_proc_pid_status,
+    .data_size = sizeof(struct proc_status_data),
+    .maxactive = 30, // 支持并发读取的数量
 };
 
 int wuwa_hide_trace_init(void) {
     int err;
-    trace_hook.address = lookup_name(trace_hook.name);
-    if (!trace_hook.address) return -ENOENT;
+    trace_kretprobe.kp.symbol_name = "proc_pid_status";
 
-    *((unsigned long *)trace_hook.original) = trace_hook.address;
-    trace_hook.ops.func = (ftrace_func_t)fh_ftrace_thunk;
+    err = register_kretprobe(&trace_kretprobe);
+    if (err < 0) {
+        pr_err("wuwa: Failed to register kretprobe for hiding TracerPid: %d\n", err);
+        return err;
+    }
 
-#ifdef CONFIG_ARM64
-    trace_hook.ops.flags = FTRACE_OPS_FL_SAVE_REGS_IF_SUPPORTED | FTRACE_OPS_FL_RECURSION_SAFE | FTRACE_OPS_FL_IPMODIFY;
-#else
-    trace_hook.ops.flags = FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_RECURSION | FTRACE_OPS_FL_IPMODIFY;
-#endif
-
-    err = ftrace_set_filter(&trace_hook.ops, (unsigned char *)trace_hook.name, strlen(trace_hook.name), 0);
-    if (err) return err;
-    
-    err = register_ftrace_function(&trace_hook.ops);
-    if (!err) pr_info("wuwa: TracerPid auto-hiding activated!\n");
-    return err;
+    pr_info("wuwa: TracerPid auto-hiding activated via Kretprobes!\n");
+    return 0;
 }
 
 void wuwa_hide_trace_exit(void) {
-    unregister_ftrace_function(&trace_hook.ops);
-    ftrace_set_filter(&trace_hook.ops, NULL, 0, 1);
+    unregister_kretprobe(&trace_kretprobe);
     pr_info("wuwa: TracerPid hider removed.\n");
 }
