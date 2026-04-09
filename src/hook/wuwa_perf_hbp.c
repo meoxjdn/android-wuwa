@@ -12,6 +12,7 @@
 #include <linux/wait.h>
 #include <linux/atomic.h>
 #include <linux/task_work.h>
+#include <linux/version.h>
 #include <asm/debug-monitors.h>
 #include <asm/processor.h>
 #include <asm/fpsimd.h>
@@ -24,16 +25,22 @@
 #define OFF_PAUSE_JMP    0x53709a0ULL
 #define OFF_KILL         0x33b2ffcULL
 #define OFF_DAMAGE_STR   0x844f4c8ULL
-#define OFF_FOV_LDR      0x0ULL        /* TODO: IDA 确认后填入实际偏移 */
+#define OFF_FOV_LDR      0x0ULL
 #define OFF_FOV_POOL     (OFF_FOV_LDR + 8ULL)
 
 #define MAX_BPS          8
-#define FOV_TARGET       120.0f
+
+/*
+ * FOV 目标值：120.0f
+ * 内核禁止 float 类型，直接用 IEEE 754 位模式
+ * python3: import struct; hex(struct.unpack('I', struct.pack('f', 120.0))[0])
+ * 120.0f = 0x42F00000
+ */
+#define FOV_TARGET_BITS  0x4089999AU
 
 /* ================================================================
  * TWA 兼容
  * ================================================================ */
-#include <linux/version.h>
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
   #define WUWA_TWA  TWA_SIGNAL
 #else
@@ -86,13 +93,13 @@ typedef int (*task_work_add_fn_t)(
     struct callback_head *,
     enum task_work_notify_mode);
 
-static reg_fn_t            fn_register       = NULL;
-static unreg_fn_t          fn_unregister     = NULL;
-static read_nofault_fn_t   fn_nofault_read   = NULL;
-static write_nofault_fn_t  fn_nofault_write  = NULL;
-static fpsimd_save_fn_t    fn_fpsimd_save    = NULL;
-static fpsimd_load_fn_t    fn_fpsimd_load    = NULL;
-static task_work_add_fn_t  fn_task_work_add  = NULL;
+static reg_fn_t            fn_register      = NULL;
+static unreg_fn_t          fn_unregister    = NULL;
+static read_nofault_fn_t   fn_nofault_read  = NULL;
+static write_nofault_fn_t  fn_nofault_write = NULL;
+static fpsimd_save_fn_t    fn_fpsimd_save   = NULL;
+static fpsimd_load_fn_t    fn_fpsimd_load   = NULL;
+static task_work_add_fn_t  fn_task_work_add = NULL;
 
 /* ================================================================
  * Kprobe 符号解析
@@ -146,7 +153,6 @@ static int resolve_all_symbols(void)
         fn_fpsimd_load = (fpsimd_load_fn_t)
             resolve_symbol("fpsimd_flush_cpu_state");
 
-    /* task_work_add 不在 GKI 白名单，通过 kprobe 解析 */
     fn_task_work_add = (task_work_add_fn_t)
         resolve_symbol("task_work_add");
 
@@ -193,11 +199,11 @@ static inline int validate_regs(struct pt_regs *regs)
 
 /* ================================================================
  * FOV 路线一：改字面量池
+ * fov_bits: float 的 IEEE 754 位模式，如 120.0f = 0x42F00000
  * ================================================================ */
-static int fov_patch_literal_pool(uint64_t game_base, float fov)
+static int fov_patch_literal_pool(uint64_t game_base, uint32_t fov_bits)
 {
     uint64_t pool_addr;
-    uint32_t bits;
     long     ret;
 
     if (OFF_FOV_LDR == 0ULL)
@@ -207,26 +213,25 @@ static int fov_patch_literal_pool(uint64_t game_base, float fov)
         return -ENOSYS;
 
     pool_addr = game_base + OFF_FOV_POOL;
-    memcpy(&bits, &fov, 4);
 
-    ret = fn_nofault_write((void __user *)pool_addr, &bits, 4);
+    ret = fn_nofault_write((void __user *)pool_addr, &fov_bits, 4);
     if (ret != 0) {
         pr_warn("[wuwa] FOV 字面量池写入失败 ret=%ld\n", ret);
         return (int)ret;
     }
 
-    pr_info("[wuwa] FOV 字面量池已更新 addr=0x%llx val=0x%08X\n",
-            pool_addr, bits);
+    pr_info("[wuwa] FOV 字面量池已更新 addr=0x%llx bits=0x%08X\n",
+            pool_addr, fov_bits);
     return 0;
 }
 
 /* ================================================================
  * FOV 路线三：fpsimd 直接操作
+ * fov_bits: float 的 IEEE 754 位模式
  * ================================================================ */
-static void fov_handle_via_fpsimd(struct pt_regs *regs, float fov)
+static void fov_handle_via_fpsimd(struct pt_regs *regs, uint32_t fov_bits)
 {
     struct user_fpsimd_state *fp;
-    uint32_t                  bits;
 
     if (!fn_fpsimd_save || !fn_fpsimd_load) {
         pr_warn_ratelimited("[wuwa] fpsimd 不可用，FOV 跳过\n");
@@ -235,14 +240,21 @@ static void fov_handle_via_fpsimd(struct pt_regs *regs, float fov)
 
     fp = &current->thread.uw.fpsimd_state;
 
+    /* 把硬件寄存器刷到内存副本 */
     fn_fpsimd_save(fp);
 
-    memcpy(&bits, &fov, 4);
+    /*
+     * 修改 V0 低 32 位（即 S0）
+     * vregs[0] 是 __uint128_t
+     * 只改低 32 位，高位保持不变
+     */
     fp->vregs[0] = (fp->vregs[0] & ~((__uint128_t)0xFFFFFFFFULL)) |
-                   (__uint128_t)bits;
+                   (__uint128_t)fov_bits;
 
+    /* 把修改后的副本写回硬件寄存器 */
     fn_fpsimd_load(fp);
 
+    /* 跳过 LDR S0,[PC,#8]，S0 已经是目标值 */
     regs->pc += 4;
 }
 
@@ -309,7 +321,7 @@ static void wuwa_hbp_handler(struct perf_event       *bp,
     /* 全屏 FOV（路线三） */
     if (g_fov_on && OFF_FOV_LDR != 0ULL &&
         pc == base + OFF_FOV_LDR) {
-        fov_handle_via_fpsimd(regs, FOV_TARGET);
+        fov_handle_via_fpsimd(regs, FOV_TARGET_BITS);
         goto out;
     }
 
@@ -433,7 +445,7 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req)
 
     /* 全屏 FOV */
     if (req->fov_on) {
-        ret = fov_patch_literal_pool(req->base_addr, FOV_TARGET);
+        ret = fov_patch_literal_pool(req->base_addr, FOV_TARGET_BITS);
         if (ret != 0 && OFF_FOV_LDR != 0ULL) {
             pr_info("[wuwa] FOV 切换到路线三\n");
             fov_needs_bp = 1;
