@@ -17,7 +17,7 @@
 
 #include "wuwa_proc.h"
 #include "wuwa_safe_signal.h"
-#include "../hook/wuwa_perf_hbp.h" /* 新增引入内核硬断头文件 */
+#include "../hook/wuwa_perf_hbp.h"
 
 int do_vaddr_translate(struct socket* sock, void* arg) {
     struct wuwa_addr_translate_cmd cmd;
@@ -47,8 +47,9 @@ int do_debug_info(struct socket* sock, void* arg) {
     debug_info_cmd.pgd_addr = (u64)current->mm->pgd;
     debug_info_cmd.pgd_phys_addr = virt_to_phys(current->mm->pgd);
     debug_info_cmd.mm_asid = ASID(current->mm);
-    debug_info_cmd.mm_right = ((uint64_t)(ASID(current->mm)) << 48 | virt_to_phys(current->mm->pgd) | (uint64_t)1) ==
-        debug_info_cmd.ttbr0_el1;
+    debug_info_cmd.mm_right = ((uint64_t)(ASID(current->mm)) << 48 |
+                                virt_to_phys(current->mm->pgd) | (uint64_t)1) ==
+                               debug_info_cmd.ttbr0_el1;
 
     if (copy_to_user(arg, &debug_info_cmd, sizeof(debug_info_cmd))) {
         return -EFAULT;
@@ -80,12 +81,12 @@ int do_at_s1e0r(struct socket* sock, void* arg) {
     put_task_struct(task);
     if (!mm) {
         wuwa_warn("failed to get mm: %d\n", cmd.pid);
-        put_task_struct(task);
         return -ESRCH;
     }
 
     u64 original_ttbr0 = read_sysreg_s(SYS_TTBR0_EL1);
-    u64 new_ttbr0 = (uint64_t)(ASID(mm)) << 48 | virt_to_phys(mm->pgd) | (uint64_t)1;
+    u64 new_ttbr0 = (uint64_t)(ASID(mm)) << 48 |
+                    virt_to_phys(mm->pgd) | (uint64_t)1;
     dsb(ish);
     asm volatile("msr ttbr0_el1, %0" ::"r"(new_ttbr0));
     dsb(ish);
@@ -135,7 +136,6 @@ int do_get_page_info(struct socket* sock, void* arg) {
     put_task_struct(task);
     if (!mm) {
         wuwa_warn("failed to get mm: %d\n", cmd.pid);
-        put_task_struct(task);
         return -ESRCH;
     }
 
@@ -161,7 +161,6 @@ int do_get_page_info(struct socket* sock, void* arg) {
 
 int do_pte_mapping(struct socket* sock, void* arg) {
 #if defined(BUILD_PTE_MAPPING)
-    // 这里需要注意 android kenel 6.6.66找不到 pte_mkwrite
     struct wuwa_sock* ws = (struct wuwa_sock*)sock->sk;
     struct wuwa_pte_mapping_cmd cmd;
     if (copy_from_user(&cmd, arg, sizeof(cmd))) {
@@ -173,7 +172,8 @@ int do_pte_mapping(struct socket* sock, void* arg) {
         return -EINVAL;
     }
 
-    if (cmd.num_pages <= 0 || cmd.num_pages > (TASK_SIZE_64 - cmd.start_addr) / PAGE_SIZE) {
+    if (cmd.num_pages <= 0 ||
+        cmd.num_pages > (TASK_SIZE_64 - cmd.start_addr) / PAGE_SIZE) {
         wuwa_warn("invalid number of pages: %zu\n", cmd.num_pages);
         return -EINVAL;
     }
@@ -206,10 +206,13 @@ int do_pte_mapping(struct socket* sock, void* arg) {
         return -ESRCH;
     }
 
-    static int (*my__pmd_alloc)(struct mm_struct* mm, pud_t* pud, unsigned long address) = NULL;
-    my__pmd_alloc = (int (*)(struct mm_struct*, pud_t*, unsigned long))kallsyms_lookup_name_ex("__pmd_alloc");
+    static int (*my__pmd_alloc)(struct mm_struct* mm, pud_t* pud,
+                                 unsigned long address) = NULL;
+    my__pmd_alloc = (int (*)(struct mm_struct*, pud_t*, unsigned long))
+        kallsyms_lookup_name_ex("__pmd_alloc");
     static int (*my__pte_alloc)(struct mm_struct* mm, pmd_t* pmd) = NULL;
-    my__pte_alloc = (int (*)(struct mm_struct*, pmd_t*))kallsyms_lookup_name_ex("__pte_alloc");
+    my__pte_alloc = (int (*)(struct mm_struct*, pmd_t*))
+        kallsyms_lookup_name_ex("__pte_alloc");
 
     if (my__pmd_alloc == NULL || my__pte_alloc == NULL) {
         wuwa_err("failed to find __pmd_alloc or __pte_alloc symbols\n");
@@ -217,12 +220,15 @@ int do_pte_mapping(struct socket* sock, void* arg) {
         goto out_mm;
     }
 
-#define my_pte_alloc(mm, pmd) (unlikely(pmd_none(*(pmd))) && my__pte_alloc(mm, pmd))
-#define my_pte_alloc_map(mm, pmd, address) (my_pte_alloc(mm, pmd) ? NULL : pte_offset_map(pmd, address))
+#define my_pte_alloc(mm, pmd) \
+    (unlikely(pmd_none(*(pmd))) && my__pte_alloc(mm, pmd))
+#define my_pte_alloc_map(mm, pmd, address) \
+    (my_pte_alloc(mm, pmd) ? NULL : pte_offset_map(pmd, address))
 
     unsigned long addr = cmd.start_addr;
     size_t i;
-    struct page** page_arr = kmalloc_array(cmd.num_pages, sizeof(struct page*), GFP_KERNEL);
+    struct page** page_arr = kmalloc_array(cmd.num_pages,
+                                            sizeof(struct page*), GFP_KERNEL);
     if (!page_arr) {
         wuwa_err("failed to allocate page array\n");
         ret = -ENOMEM;
@@ -296,31 +302,29 @@ int do_pte_mapping(struct socket* sock, void* arg) {
     }
 
     flush_tlb_all();
-
     mmput(mm);
 
     for (int i = 0; i < cmd.num_pages; ++i) {
         struct page* p = page_arr[i];
-
         if (!p) {
             wuwa_err("page %d is NULL\n", i);
             continue;
         }
-
         if (!ws->used_pages) {
             wuwa_err("used_pages array not initialized\n");
             break;
         }
-
         arraylist_add(ws->used_pages, p);
     }
     kfree(page_arr);
 
     if (cmd.hide) {
-        wuwa_add_unsafe_region(ws->session, task->cred->uid.val, cmd.start_addr, cmd.num_pages);
+        wuwa_add_unsafe_region(ws->session, task->cred->uid.val,
+                                cmd.start_addr, cmd.num_pages);
     }
 
-    wuwa_info("successfully mapped page at address 0x%lx for pid %d\n", cmd.start_addr, cmd.pid);
+    wuwa_info("successfully mapped page at address 0x%lx for pid %d\n",
+              cmd.start_addr, cmd.pid);
     return 0;
 
 rollback:
@@ -353,58 +357,28 @@ int do_page_table_walk(struct socket* sock, void* arg) {
         return -ESRCH;
     }
 
-    // Traverse page tables and collect statistics
     traverse_page_tables(mm, &stats);
 
-    // Copy statistics to command structure
-    cmd.total_pte_count = stats.total_pte_count;
+    cmd.total_pte_count   = stats.total_pte_count;
     cmd.present_pte_count = stats.present_pte_count;
-    cmd.pmd_huge_count = stats.pmd_huge_count;
-    cmd.pud_huge_count = stats.pud_huge_count;
+    cmd.pmd_huge_count    = stats.pmd_huge_count;
+    cmd.pud_huge_count    = stats.pud_huge_count;
 
     mmput(mm);
     put_task_struct(task);
 
-    // Copy result back to userspace
     if (copy_to_user(arg, &cmd, sizeof(cmd))) {
         return -EFAULT;
     }
 
-    wuwa_info("page table walk for pid %d: total_pte=%llu, present_pte=%llu, pmd_huge=%llu, pud_huge=%llu\n",
-              cmd.pid, cmd.total_pte_count, cmd.present_pte_count, cmd.pmd_huge_count, cmd.pud_huge_count);
-
     return 0;
 }
 
-// static void (*wake_up_new_task)(struct task_struct *tsk) = NULL;
-// if (!wake_up_new_task) {
-//     wake_up_new_task = (void (*)(struct task_struct *))kallsyms_lookup_name_ex("wake_up_new_task");
-// }
-//
-// wake_up_new_task(p);
-// static __latent_entropy struct task_struct *(*copy_process)(
-//             struct pid *pid,
-//             int trace,
-//             int node,
-//             struct kernel_clone_args *args) = NULL;
-// if (copy_process == NULL) {
-//     copy_process = (typeof(copy_process))kallsyms_lookup_name_ex("copy_process");
-// }
-//
-// if (!copy_process) {
-//     ovo_warn("copy_process symbol not found\n");
-//     return -ENOENT;
-// }
-// __latent_entropy struct task_struct *copy_process(
-//                     struct pid *pid,
-//                     int trace,
-//                     int node,
-//                     struct kernel_clone_args *args)
 int do_copy_process(struct socket* sock, void* arg) {
     int ret = 0;
     struct wuwa_copy_process_cmd cmd;
     struct pid* pid;
-    struct task_struct* task /*, *p*/;
+    struct task_struct* task;
 
     if (copy_from_user(&cmd, arg, sizeof(cmd))) {
         return -EFAULT;
@@ -414,7 +388,6 @@ int do_copy_process(struct socket* sock, void* arg) {
         wuwa_err("invalid function pointer or child stack\n");
         return -EINVAL;
     }
-
 
     pid = find_get_pid(cmd.pid);
     if (!pid) {
@@ -430,8 +403,6 @@ int do_copy_process(struct socket* sock, void* arg) {
     }
 
     ret = -1;
-    // cproc源码无了，这里取消
-    // ret = create_remote_thread(task, &p, cmd.child_tid, NULL, cmd.flags);
     put_task_struct(task);
     if (ret) {
         wuwa_err("failed to create remote thread: %d\n", ret);
@@ -445,7 +416,9 @@ prepare_fault:
 }
 
 #if !defined(ARCH_HAS_VALID_PHYS_ADDR_RANGE) || defined(MODULE)
-static inline int memk_valid_phys_addr_range(uintptr_t addr, size_t size) { return addr + size <= __pa(high_memory); }
+static inline int memk_valid_phys_addr_range(uintptr_t addr, size_t size) {
+    return addr + size <= __pa(high_memory);
+}
 #define IS_VALID_PHYS_ADDR_RANGE(x, y) memk_valid_phys_addr_range(x, y)
 #else
 #define IS_VALID_PHYS_ADDR_RANGE(x, y) valid_phys_addr_range(x, y)
@@ -461,7 +434,8 @@ int do_read_physical_memory(struct socket* sock, void __user* arg) {
         return -EFAULT;
     }
 
-    ret = translate_process_vaddr(cmd.pid, cmd.src_va, (uintptr_t*)&cmd.phy_addr);
+    ret = translate_process_vaddr(cmd.pid, cmd.src_va,
+                                   (uintptr_t*)&cmd.phy_addr);
     if (ret < 0) {
         return ret;
     }
@@ -471,7 +445,8 @@ int do_read_physical_memory(struct socket* sock, void __user* arg) {
     }
 
     pa = cmd.phy_addr;
-    if (!pa || !pfn_valid(__phys_to_pfn(pa)) || !IS_VALID_PHYS_ADDR_RANGE(pa, cmd.size)) {
+    if (!pa || !pfn_valid(__phys_to_pfn(pa)) ||
+        !IS_VALID_PHYS_ADDR_RANGE(pa, cmd.size)) {
         return -EFAULT;
     }
 
@@ -534,7 +509,8 @@ int do_write_physical_memory(struct socket* sock, void __user* arg) {
         return -EFAULT;
     }
 
-    ret = translate_process_vaddr(cmd.pid, cmd.dst_va, (uintptr_t*)&cmd.phy_addr);
+    ret = translate_process_vaddr(cmd.pid, cmd.dst_va,
+                                   (uintptr_t*)&cmd.phy_addr);
     if (ret < 0) {
         return ret;
     }
@@ -544,7 +520,8 @@ int do_write_physical_memory(struct socket* sock, void __user* arg) {
     }
 
     pa = cmd.phy_addr;
-    if (!pa || !pfn_valid(__phys_to_pfn(pa)) || !IS_VALID_PHYS_ADDR_RANGE(pa, cmd.size)) {
+    if (!pa || !pfn_valid(__phys_to_pfn(pa)) ||
+        !IS_VALID_PHYS_ADDR_RANGE(pa, cmd.size)) {
         return -EFAULT;
     }
 
@@ -586,8 +563,6 @@ int do_hide_process(struct socket* sock, void* arg) {
         return -ESRCH;
     task->flags ^= PF_INVISIBLE;
 
-    // todo: hook getdents64
-
     return -EINVAL;
 }
 
@@ -617,12 +592,10 @@ int do_read_physical_memory_ioremap(struct socket* sock, void* arg) {
         return -EFAULT;
     }
 
-    // Validate size
     if (cmd.size == 0 || cmd.size > PAGE_SIZE) {
         return -EFAULT;
     }
 
-    // Validate and convert memory type
     if (cmd.prot < WMT_NORMAL || cmd.prot > WMT_NORMAL_iNC_oWB) {
         return -EINVAL;
     }
@@ -632,18 +605,15 @@ int do_read_physical_memory_ioremap(struct socket* sock, void* arg) {
         return ret;
     }
 
-    // Translate virtual address to physical
     ret = translate_process_vaddr(cmd.pid, cmd.src_va, &cmd.phy_addr);
     if (ret < 0) {
         return ret;
     }
 
-    // Return physical address to userspace
     if (copy_to_user(arg, &cmd, sizeof(cmd))) {
         return -EFAULT;
     }
 
-    // Map and read physical memory
     pa = cmd.phy_addr;
     if (!pa || !pfn_valid(__phys_to_pfn(pa))) {
         return -EFAULT;
@@ -672,12 +642,10 @@ int do_write_physical_memory_ioremap(struct socket* sock, void* arg) {
         return -EFAULT;
     }
 
-    // Validate size
     if (cmd.size == 0 || cmd.size > PAGE_SIZE) {
         return -EFAULT;
     }
 
-    // Validate and convert memory type
     if (cmd.prot < WMT_NORMAL || cmd.prot > WMT_NORMAL_iNC_oWB) {
         return -EINVAL;
     }
@@ -687,18 +655,15 @@ int do_write_physical_memory_ioremap(struct socket* sock, void* arg) {
         return ret;
     }
 
-    // Translate virtual address to physical
     ret = translate_process_vaddr(cmd.pid, cmd.src_va, &cmd.phy_addr);
     if (ret < 0) {
         return ret;
     }
 
-    // Return physical address to userspace
     if (copy_to_user(arg, &cmd, sizeof(cmd))) {
         return -EFAULT;
     }
 
-    // Map and read physical memory
     pa = cmd.phy_addr;
     if (!pa || !pfn_valid(__phys_to_pfn(pa))) {
         return -EFAULT;
@@ -723,55 +688,44 @@ int do_list_processes(struct socket* sock, void __user* arg) {
     size_t process_count = 0;
     int ret = 0;
 
-    // Copy command from userspace
     if (copy_from_user(&cmd, arg, sizeof(cmd))) {
         return -EFAULT;
     }
 
-    // Validate bitmap size (must be at least 8192 bytes for PID 0-65535)
     if (cmd.bitmap_size < 8192) {
-        wuwa_warn("bitmap size too small: %zu (minimum 8192)\n", cmd.bitmap_size);
+        wuwa_warn("bitmap size too small: %zu (minimum 8192)\n",
+                  cmd.bitmap_size);
         return -EINVAL;
     }
 
-    // Allocate kernel bitmap buffer
     kernel_bitmap = kzalloc(cmd.bitmap_size, GFP_KERNEL);
     if (!kernel_bitmap) {
         wuwa_err("failed to allocate kernel bitmap\n");
         return -ENOMEM;
     }
 
-    // Iterate through all processes and set corresponding bits
     rcu_read_lock();
     for_each_process(task) {
         pid_t pid = task->pid;
-        
-        // Check if PID is within bitmap range
         if (pid >= 0 && pid < (cmd.bitmap_size * 8)) {
             size_t byte_index = pid / 8;
-            size_t bit_index = pid % 8;
-            
-            // Set the bit
+            size_t bit_index  = pid % 8;
             kernel_bitmap[byte_index] |= (1 << bit_index);
             process_count++;
         }
     }
     rcu_read_unlock();
 
-    // Copy bitmap to userspace
     if (copy_to_user(cmd.bitmap, kernel_bitmap, cmd.bitmap_size)) {
         ret = -EFAULT;
         goto out_free;
     }
 
-    // Update process count and copy back to userspace
     cmd.process_count = process_count;
     if (copy_to_user(arg, &cmd, sizeof(cmd))) {
         ret = -EFAULT;
         goto out_free;
     }
-
-    wuwa_info("listed %zu processes in bitmap\n", process_count);
 
 out_free:
     kfree(kernel_bitmap);
@@ -785,12 +739,10 @@ int do_get_process_info(struct socket* sock, void __user* arg) {
     char cmdline[256];
     int ret = 0;
 
-    // Copy command from userspace
     if (copy_from_user(&cmd, arg, sizeof(cmd))) {
         return -EFAULT;
     }
 
-    // Find process by PID
     pid_struct = find_get_pid(cmd.pid);
     if (!pid_struct) {
         wuwa_warn("failed to find pid_struct: %d\n", cmd.pid);
@@ -804,17 +756,16 @@ int do_get_process_info(struct socket* sock, void __user* arg) {
         return -ESRCH;
     }
 
-    // Extract basic process information
     cmd.tgid = task->tgid;
-    cmd.uid = task->cred->uid.val;
+    cmd.uid  = task->cred->uid.val;
     cmd.ppid = task->real_parent ? task->real_parent->pid : 0;
     cmd.prio = task->prio;
 
-    // Try to get full command line
     cmdline[0] = '\0';
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
-    static int (*my_get_cmdline)(struct task_struct* task, char* buffer, int buflen) = NULL;
+    static int (*my_get_cmdline)(struct task_struct* task,
+                                  char* buffer, int buflen) = NULL;
     if (my_get_cmdline == NULL) {
         my_get_cmdline = (void*)kallsyms_lookup_name_ex("get_cmdline");
     }
@@ -825,7 +776,6 @@ int do_get_process_info(struct socket* sock, void __user* arg) {
         ret = -1;
     }
 #else
-    // Use fallback for older kernels
     if (task->mm != NULL) {
         struct mm_struct* mm = get_task_mm(task);
         if (mm) {
@@ -834,14 +784,15 @@ int do_get_process_info(struct socket* sock, void __user* arg) {
 
             spin_lock(&mm->arg_lock);
             arg_start = mm->arg_start;
-            arg_end = mm->arg_end;
+            arg_end   = mm->arg_end;
             spin_unlock(&mm->arg_lock);
 
             len = arg_end - arg_start;
             if (len > sizeof(cmdline) - 1)
                 len = sizeof(cmdline) - 1;
 
-            ret = access_process_vm(task, arg_start, cmdline, len, FOLL_FORCE);
+            ret = access_process_vm(task, arg_start, cmdline, len,
+                                     FOLL_FORCE);
             mmput(mm);
         } else {
             ret = -1;
@@ -851,16 +802,13 @@ int do_get_process_info(struct socket* sock, void __user* arg) {
     }
 #endif
 
-    // Fallback to task->comm if cmdline retrieval failed
     if (ret < 0 || cmdline[0] == '\0') {
         strncpy(cmd.name, task->comm, sizeof(cmd.name) - 1);
     } else {
-        // Extract program name (first part before space)
         char* space = strchr(cmdline, ' ');
         if (space) *space = '\0';
 
-        // Extract filename from path
-        char* slash = strrchr(cmdline, '/');
+        char* slash    = strrchr(cmdline, '/');
         char* prog_name = slash ? (slash + 1) : cmdline;
 
         strncpy(cmd.name, prog_name, sizeof(cmd.name) - 1);
@@ -869,27 +817,31 @@ int do_get_process_info(struct socket* sock, void __user* arg) {
 
     put_task_struct(task);
 
-    // Copy result back to userspace
     if (copy_to_user(arg, &cmd, sizeof(cmd))) {
         return -EFAULT;
     }
 
-    wuwa_info("retrieved info for process %d: tgid=%d, name=%s, uid=%d, ppid=%d, prio=%d\n",
-              cmd.pid, cmd.tgid, cmd.name, cmd.uid, cmd.ppid, cmd.prio);
-
     return 0;
 }
 
-/* 新增：Perf HBP 内核硬件断点通信处理函数 */
+/* ================================================================
+ * Perf HBP 内核硬件断点通信处理函数
+ * ================================================================ */
 int do_set_perf_hbp(struct socket* sock, void __user* arg) {
     struct wuwa_hbp_req req;
-    
-    // 从用户态(C++工具)拷贝配置参数到内核态
+
+    /* 水印：确认函数被调用 */
+    pr_info("[wuwa] ===== do_set_perf_hbp CALLED =====\n");
+
     if (copy_from_user(&req, arg, sizeof(req))) {
-        wuwa_err("failed to copy wuwa_hbp_req from user\n");
+        pr_err("[wuwa] copy_from_user failed\n");
         return -EFAULT;
     }
 
-    // 调用我们在 wuwa_perf_hbp.c 中写的核心注册逻辑
+    pr_info("[wuwa] req: tid=%d base=0x%llx fov=%d border=%d "
+            "skip=%d damage=%d maxhp=%d\n",
+            req.tid, req.base_addr, req.fov_on, req.border_on,
+            req.skip_on, req.damage_on, req.maxhp_on);
+
     return wuwa_install_perf_hbp(&req);
 }
