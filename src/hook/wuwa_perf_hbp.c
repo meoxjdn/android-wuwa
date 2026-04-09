@@ -24,20 +24,14 @@
 #define OFF_PAUSE_JMP    0x53709a0ULL
 #define OFF_KILL         0x33b2ffcULL
 #define OFF_DAMAGE_STR   0x844f4c8ULL
-
-/*
- * FOV 相关：填入你在 IDA 里找到的 LDR S0,[PC,#8] 的偏移
- * 在确认之前先设为 0，FOV 功能会自动降级到字面量池方案
- * 字面量池方案不需要断点，OFF_FOV_LDR = 0 时不会安装断点
- */
-#define OFF_FOV_LDR      0x0ULL   /* TODO: IDA确认后填入实际偏移 */
+#define OFF_FOV_LDR      0x0ULL        /* TODO: IDA 确认后填入实际偏移 */
 #define OFF_FOV_POOL     (OFF_FOV_LDR + 8ULL)
 
 #define MAX_BPS          8
 #define FOV_TARGET       120.0f
 
 /* ================================================================
- * TWA_RESUME 兼容：6.6 内核改为 TWA_SIGNAL
+ * TWA 兼容
  * ================================================================ */
 #include <linux/version.h>
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
@@ -87,12 +81,18 @@ typedef long (*write_nofault_fn_t)(
 typedef void (*fpsimd_save_fn_t)(struct user_fpsimd_state *);
 typedef void (*fpsimd_load_fn_t)(const struct user_fpsimd_state *);
 
-static reg_fn_t           fn_register      = NULL;
-static unreg_fn_t         fn_unregister    = NULL;
-static read_nofault_fn_t  fn_nofault_read  = NULL;
-static write_nofault_fn_t fn_nofault_write = NULL;
-static fpsimd_save_fn_t   fn_fpsimd_save   = NULL;
-static fpsimd_load_fn_t   fn_fpsimd_load   = NULL;
+typedef int (*task_work_add_fn_t)(
+    struct task_struct *,
+    struct callback_head *,
+    enum task_work_notify_mode);
+
+static reg_fn_t            fn_register       = NULL;
+static unreg_fn_t          fn_unregister     = NULL;
+static read_nofault_fn_t   fn_nofault_read   = NULL;
+static write_nofault_fn_t  fn_nofault_write  = NULL;
+static fpsimd_save_fn_t    fn_fpsimd_save    = NULL;
+static fpsimd_load_fn_t    fn_fpsimd_load    = NULL;
+static task_work_add_fn_t  fn_task_work_add  = NULL;
 
 /* ================================================================
  * Kprobe 符号解析
@@ -146,22 +146,27 @@ static int resolve_all_symbols(void)
         fn_fpsimd_load = (fpsimd_load_fn_t)
             resolve_symbol("fpsimd_flush_cpu_state");
 
+    /* task_work_add 不在 GKI 白名单，通过 kprobe 解析 */
+    fn_task_work_add = (task_work_add_fn_t)
+        resolve_symbol("task_work_add");
+
     if (!fn_register || !fn_unregister) {
         pr_err("[wuwa] 核心符号解析失败\n");
         return -ENOSYS;
     }
 
+    if (!fn_task_work_add)
+        pr_warn("[wuwa] task_work_add 不可用，退出钩子禁用\n");
     if (!fn_nofault_read)
         pr_warn("[wuwa] 内存安全读取不可用\n");
-
     if (!fn_fpsimd_save || !fn_fpsimd_load)
-        pr_warn("[wuwa] fpsimd 符号不可用，FOV 将走字面量池方案\n");
+        pr_warn("[wuwa] fpsimd 不可用，FOV 走字面量池方案\n");
 
     return 0;
 }
 
 /* ================================================================
- * 安全内存读取封装
+ * 安全内存读取
  * ================================================================ */
 static inline int safe_read_u32(uint64_t addr, uint32_t *out)
 {
@@ -187,7 +192,7 @@ static inline int validate_regs(struct pt_regs *regs)
 }
 
 /* ================================================================
- * FOV 路线一：改字面量池（首选，零断点开销）
+ * FOV 路线一：改字面量池
  * ================================================================ */
 static int fov_patch_literal_pool(uint64_t game_base, float fov)
 {
@@ -195,7 +200,6 @@ static int fov_patch_literal_pool(uint64_t game_base, float fov)
     uint32_t bits;
     long     ret;
 
-    /* OFF_FOV_LDR 未填入时跳过 */
     if (OFF_FOV_LDR == 0ULL)
         return -ENOENT;
 
@@ -211,13 +215,13 @@ static int fov_patch_literal_pool(uint64_t game_base, float fov)
         return (int)ret;
     }
 
-    pr_info("[wuwa] FOV 字面量池已更新 addr=0x%llx val=0x%08X (%.2f)\n",
-            pool_addr, bits, fov);
+    pr_info("[wuwa] FOV 字面量池已更新 addr=0x%llx val=0x%08X\n",
+            pool_addr, bits);
     return 0;
 }
 
 /* ================================================================
- * FOV 路线三：fpsimd 直接操作（字面量池写保护时备用）
+ * FOV 路线三：fpsimd 直接操作
  * ================================================================ */
 static void fov_handle_via_fpsimd(struct pt_regs *regs, float fov)
 {
@@ -239,7 +243,6 @@ static void fov_handle_via_fpsimd(struct pt_regs *regs, float fov)
 
     fn_fpsimd_load(fp);
 
-    /* 跳过 LDR S0,[PC,#8]，S0 已经是目标值 */
     regs->pc += 4;
 }
 
@@ -270,36 +273,27 @@ static void wuwa_hbp_handler(struct perf_event       *bp,
     pc   = regs->pc;
     base = READ_ONCE(g_game_base);
 
-    /* ----------------------------------------------------------------
-     * 功能 1：去黑边
-     * ---------------------------------------------------------------- */
+    /* 去黑边 */
     if (g_border_on && pc == base + OFF_BORDER) {
         regs->regs[0] = 1;
         regs->pc      = regs->regs[30];
         goto out;
     }
 
-    /* ----------------------------------------------------------------
-     * 功能 2：秒过副本
-     * ---------------------------------------------------------------- */
+    /* 秒过副本 */
     if (g_skip_on && pc == base + OFF_PAUSE_WIN) {
         regs->pc = base + OFF_PAUSE_JMP;
         goto out;
     }
 
-    /* ----------------------------------------------------------------
-     * 功能 3：1血秒杀
-     * ---------------------------------------------------------------- */
+    /* 1血秒杀 */
     if (g_maxhp_on && pc == base + OFF_KILL) {
         regs->regs[0] = 1;
         regs->pc      = regs->regs[30];
         goto out;
     }
 
-    /* ----------------------------------------------------------------
-     * 功能 4：智能无敌
-     * STR W0,[X1,#0x2C]：玩家跳过写入，敌人放行
-     * ---------------------------------------------------------------- */
+    /* 智能无敌 */
     if (g_damage_on && pc == base + OFF_DAMAGE_STR) {
         uint32_t team_id = 1;
 
@@ -312,10 +306,7 @@ static void wuwa_hbp_handler(struct perf_event       *bp,
         goto out;
     }
 
-    /* ----------------------------------------------------------------
-     * 功能 5：全屏 FOV（路线三断点方案）
-     * OFF_FOV_LDR == 0 时此断点不会被安装，此分支不会触发
-     * ---------------------------------------------------------------- */
+    /* 全屏 FOV（路线三） */
     if (g_fov_on && OFF_FOV_LDR != 0ULL &&
         pc == base + OFF_FOV_LDR) {
         fov_handle_via_fpsimd(regs, FOV_TARGET);
@@ -419,43 +410,37 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req)
     /* 去黑边 */
     if (req->border_on && g_bp_count < MAX_BPS) {
         bp = install_bp(tsk, req->base_addr + OFF_BORDER);
-        if (bp)
-            g_bps[g_bp_count++] = bp;
+        if (bp) g_bps[g_bp_count++] = bp;
     }
 
     /* 秒过副本 */
     if (req->skip_on && g_bp_count < MAX_BPS) {
         bp = install_bp(tsk, req->base_addr + OFF_PAUSE_WIN);
-        if (bp)
-            g_bps[g_bp_count++] = bp;
+        if (bp) g_bps[g_bp_count++] = bp;
     }
 
     /* 1血秒杀 */
     if (req->maxhp_on && g_bp_count < MAX_BPS) {
         bp = install_bp(tsk, req->base_addr + OFF_KILL);
-        if (bp)
-            g_bps[g_bp_count++] = bp;
+        if (bp) g_bps[g_bp_count++] = bp;
     }
 
     /* 智能无敌 */
     if (req->damage_on && g_bp_count < MAX_BPS) {
         bp = install_bp(tsk, req->base_addr + OFF_DAMAGE_STR);
-        if (bp)
-            g_bps[g_bp_count++] = bp;
+        if (bp) g_bps[g_bp_count++] = bp;
     }
 
     /* 全屏 FOV */
     if (req->fov_on) {
         ret = fov_patch_literal_pool(req->base_addr, FOV_TARGET);
         if (ret != 0 && OFF_FOV_LDR != 0ULL) {
-            pr_info("[wuwa] FOV 切换到路线三（fpsimd 断点方案）\n");
+            pr_info("[wuwa] FOV 切换到路线三\n");
             fov_needs_bp = 1;
         }
-
         if (fov_needs_bp && g_bp_count < MAX_BPS) {
             bp = install_bp(tsk, req->base_addr + OFF_FOV_LDR);
-            if (bp)
-                g_bps[g_bp_count++] = bp;
+            if (bp) g_bps[g_bp_count++] = bp;
         }
     }
 
@@ -463,8 +448,13 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req)
     cw = kmalloc(sizeof(*cw), GFP_KERNEL);
     if (cw) {
         init_task_work(&cw->work, wuwa_on_game_exit);
-        if (task_work_add(tsk, &cw->work, WUWA_TWA) != 0)
+        if (fn_task_work_add) {
+            if (fn_task_work_add(tsk, &cw->work, WUWA_TWA) != 0)
+                kfree(cw);
+        } else {
             kfree(cw);
+            pr_warn("[wuwa] 退出钩子未挂载，游戏退出后请手动 rmmod\n");
+        }
     }
 
     mutex_unlock(&g_bp_mutex);
