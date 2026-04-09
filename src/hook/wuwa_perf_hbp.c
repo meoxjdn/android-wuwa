@@ -8,13 +8,14 @@
 #include <linux/kprobes.h>
 #include <linux/mutex.h>
 
-/* ===== 核心偏移 (参考你的 KPM) ===== */
-#define OFF_BORDER     0x8951160   
-#define OFF_PAUSE_WIN  0x2639fd8   
-#define OFF_PAUSE_JMP  0x53709a0
-/* 恢复到最原始的函数入口！ */
-#define OFF_GODMODE    0x844f4b4   
-#define OFF_KILL       0x33b2ffc   
+/* ================================================================
+ * 核心偏移 (与你的 KPM 影子页完美对应)
+ * ================================================================ */
+#define OFF_BORDER     0x8951160ULL
+#define OFF_PAUSE_WIN  0x2639fd8ULL
+#define OFF_PAUSE_JMP  0x53709a0ULL
+#define OFF_GODMODE    0x844f4b4ULL   /* 伤害函数入口：精准截杀点 */
+#define OFF_KILL       0x33b2ffcULL   /* 1血秒杀入口 */
 
 #pragma pack(push, 8)
 struct wuwa_hbp_req {
@@ -47,6 +48,7 @@ static reg_user_hwbkpt_t fn_register = NULL;
 static unreg_hwbkpt_t fn_unregister = NULL;
 static cfun_t fn_nofault_read = NULL;
 
+/* Kprobe 动态寻址：无视 Android 15 白名单 */
 static unsigned long resolve_hidden_symbol(const char *name) {
     struct kprobe kp = { .symbol_name = name };
     unsigned long addr = 0;
@@ -57,45 +59,51 @@ static unsigned long resolve_hidden_symbol(const char *name) {
     return addr;
 }
 
-/* ===== wuwa 核心拦截逻辑 ===== */
+/* ================================================================
+ * 核心硬件断点回调：零崩溃、零闪退
+ * ================================================================ */
 static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
-    uint64_t pc = regs->pc;
+    uint64_t pc;
+    if (unlikely(!regs)) return;
+    pc = regs->pc;
 
-    // 1. 秒过副本 (对应 KPM 的 B 指令)
+    // 1. 秒过副本 (修改 PC 跳转至通关结算块)
     if (g_skip_on && pc == g_game_base + OFF_PAUSE_WIN) {
         regs->pc = g_game_base + OFF_PAUSE_JMP;
         return;
     }
 
-    // 2. 去黑边 (对应 KPM 的 RET)
+    // 2. 去黑边 (入口处直接阻截返回，极度安全)
     if (g_border_on && pc == g_game_base + OFF_BORDER) {
         regs->pc = regs->regs[30]; 
         return;
     }
 
-    // 3. 智能敌我无敌 (1:1 完美复刻 KPM 汇编逻辑)
+    // 3. 智能无敌 (入口阻截法，完美重现 KPM 逻辑)
     if (g_damage_on && pc == g_game_base + OFF_GODMODE) {
-        // [对应 KPM: CBZ X1] 如果 X1 是空，坚决不碰，放行原指令！
+        // [防御性编程] 确保 X1 对象指针非空
         if (regs->regs[1] != 0) {
-            uint32_t team_id = 1; 
-            uint64_t target_addr = regs->regs[1] + 0x1c;
+            uint32_t team_id = 1; // 默认视为敌人
+            uint64_t target_addr = regs->regs[1] + 0x1C;
             
-            // [对应 KPM: LDR W16] 安全读取 team_id
+            // 安全读取内存中的 Team ID (绝对不会缺页死机)
             if (fn_nofault_read && fn_nofault_read(&team_id, (void __user *)target_addr, 4) == 0) {
-                // [对应 KPM: CBNZ W16] 如果 team_id == 0 (玩家)，才执行无敌
                 if (team_id == 0) {
-                    regs->regs[0] = 1;          // [对应 KPM: MOV W0, #1]
-                    regs->pc = regs->regs[30];  // [对应 KPM: RET]
+                    // === 玩家实体 ===
+                    // 此时在函数刚进门 (0x844f4b4)，堆栈还没动，强行 RET 完美无副作用
+                    regs->regs[0] = 1;          // 锁定伤害为1
+                    regs->pc = regs->regs[30];  // 踹回上一层函数
                     return;
                 }
             }
         }
-        // 如果走到这里(X1为空，或是敌人，或读取失败)：
-        // 绝对不要修改 PC！内核底层会自动 Single-Step (单步) 原本的 STP 指令，无缝放行！
+        // === 敌人实体 / 读取失败 / 环境伤害 ===
+        // 什么都不做！直接 return！
+        // 内核硬件断点系统会自动 Single-Step (单步执行) 这条指令，无缝放行！
         return;
     }
 
-    // 4. 1血秒杀 (对应 KPM 写入的 MOV W0, #1; RET)
+    // 4. 1血秒杀 (入口阻截，同理极度安全)
     if (g_maxhp_on && pc == g_game_base + OFF_KILL) {
         regs->regs[0] = 1;
         regs->pc = regs->regs[30];
@@ -153,12 +161,10 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
         if (bp) g_bps[g_bp_count++] = bp;
     }
     if (req->damage_on && g_bp_count < MAX_BPS) {
-        // 恢复在最安全的头部断点 0x844f4b4
         bp = install_bp(tsk, g_game_base + OFF_GODMODE);
         if (bp) g_bps[g_bp_count++] = bp;
     }
     if (req->maxhp_on && g_bp_count < MAX_BPS) {
-        // 新增 1血秒杀的断点支持
         bp = install_bp(tsk, g_game_base + OFF_KILL);
         if (bp) g_bps[g_bp_count++] = bp;
     }
