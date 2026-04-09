@@ -38,10 +38,7 @@ static struct perf_event *g_bps[MAX_BPS];
 static int g_bp_count = 0;
 static DEFINE_SPINLOCK(g_bp_lock);
 
-/* * 【救命神器】安全的原子内存读取！
- * 在硬件断点的回调中（中断上下文），绝对不能直接使用 copy_from_user（会休眠导致手机立刻内核崩溃死机）。
- * 这个函数通过临时禁用缺页中断，实现了和 ptrace 一样安全的内存窥探。
- */
+/* 安全内存读取，防止 copy_from_user 导致中断休眠死机 */
 static int safe_read_u32(uint64_t addr, uint32_t *val) {
     int ret;
     pagefault_disable();
@@ -71,17 +68,12 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
         uint32_t flag = 0;
         uint64_t target_addr = regs->regs[1] + 0x1c;
         
-        // 安全读取目标地址的值 (对应你之前的 flag == 1 判定)
         if (safe_read_u32(target_addr, &flag) == 0) {
             if (flag == 1) {
-                /* 【巨大优势】内核 perf_event 极其智能！
-                 * 如果你不修改 PC 并直接 return，Linux内核会自动在底层帮你完成单步执行 (Single-step)，
-                 * 越过当前指令后再自动恢复断点。完全不需要像 Ptrace 那样手动清空再恢复！
-                 */
+                /* 内核自动单步跳过并放行 */
                 return; 
             }
         }
-        // 篡改伤害并返回
         regs->regs[0] = 1;
         regs->pc = regs->regs[30];
         return;
@@ -103,7 +95,7 @@ static struct perf_event *install_bp(struct task_struct *tsk, uint64_t addr) {
     hw_breakpoint_init(&attr);
     attr.bp_addr = addr;
     attr.bp_len = HW_BREAKPOINT_LEN_4;
-    attr.bp_type = HW_BREAKPOINT_X; // 监控代码执行
+    attr.bp_type = HW_BREAKPOINT_X; 
     attr.disabled = 0;
 
     bp = register_user_hw_breakpoint(&attr, wuwa_hbp_handler, NULL, tsk);
@@ -112,26 +104,24 @@ static struct perf_event *install_bp(struct task_struct *tsk, uint64_t addr) {
     return bp;
 }
 
-/* ===== 与 C++ 工具通信的入口 ===== */
-int wuwa_install_perf_hbp(void *arg) {
+/* ===== 与 C++ 工具通信的入口 (已修复类型冲突) ===== */
+int wuwa_install_perf_hbp(struct wuwa_hbp_req *user_req) {
     struct wuwa_hbp_req req;
     struct task_struct *tsk;
     struct perf_event *bp;
     struct pid *pid_struct;
 
-    // 这里是 ioctl 进程上下文，允许休眠，可以使用常规 copy_from_user
-    if (copy_from_user(&req, arg, sizeof(req))) {
+    // 将用户态指针强制转换读取，匹配头文件声明
+    if (copy_from_user(&req, (void __user *)user_req, sizeof(req))) {
         return -EFAULT;
     }
 
-    // 更新游戏基址和开关
     g_game_base = req.base_addr;
     g_border_on = req.border_on;
     g_skip_on = req.skip_on;
     g_damage_on = req.damage_on;
     g_maxhp_on = req.maxhp_on;
 
-    // 查找目标线程
     pid_struct = find_get_pid(req.tid);
     if (!pid_struct) return -ESRCH;
 
@@ -142,7 +132,6 @@ int wuwa_install_perf_hbp(void *arg) {
     }
 
     spin_lock(&g_bp_lock);
-    // 按需为线程注入硬件断点
     if (req.border_on && g_bp_count < MAX_BPS) {
         bp = install_bp(tsk, g_game_base + OFF_BORDER);
         if (bp) g_bps[g_bp_count++] = bp;
@@ -165,7 +154,7 @@ int wuwa_install_perf_hbp(void *arg) {
     return 0; 
 }
 
-/* ===== 清理函数 (清理环境/rmmod 时调用) ===== */
+/* ===== 清理函数 ===== */
 void wuwa_cleanup_perf_hbp(void) {
     int i;
     spin_lock(&g_bp_lock);
