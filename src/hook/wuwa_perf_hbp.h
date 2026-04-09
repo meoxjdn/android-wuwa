@@ -4,17 +4,8 @@
 
 #include <linux/types.h>
 
-#pragma pack(push, 8)
-struct wuwa_hbp_req {
-    int      tid;
-    uint64_t base_addr;
-    int      fov_on;
-    int      border_on;
-    int      skip_on;
-    int      damage_on;
-    int      maxhp_on;
-};
-#pragma pack(pop)
+/* 前向声明，避免循环 include */
+struct wuwa_hbp_req;
 
 int  wuwa_install_perf_hbp(struct wuwa_hbp_req *req);
 void wuwa_cleanup_perf_hbp(void);
