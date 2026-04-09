@@ -47,16 +47,23 @@ static int wuwa_ioctl(struct socket* sock, unsigned int cmd, unsigned long arg) 
 
     int i;
     for (i = 0; i < ARRAY_SIZE(ioctl_handlers); i++) {
+        if (ioctl_handlers[i].cmd == 0)
+            break; /* 哨兵 */
+
+        pr_info("[wuwa] checking handler[%d] cmd=%u vs %u\n",
+                i, ioctl_handlers[i].cmd, cmd);
+
         if (cmd == ioctl_handlers[i].cmd) {
             if (ioctl_handlers[i].handler == NULL) {
+                pr_warn("[wuwa] handler[%d] is NULL\n", i);
                 continue;
             }
-            pr_info("[wuwa] ioctl dispatching to handler[%d]\n", i);
+            pr_info("[wuwa] dispatching to handler[%d]\n", i);
             return ioctl_handlers[i].handler(sock, argp);
         }
     }
 
-    wuwa_warn("unsupported ioctl command: %u\n", cmd);
+    pr_warn("[wuwa] unsupported ioctl command: %u\n", cmd);
     return -ENOTTY;
 }
 
