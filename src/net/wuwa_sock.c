@@ -1,4 +1,3 @@
-/* wuwa_sock.c */
 #include "wuwa_sock.h"
 #include <asm/pgalloc.h>
 #include <asm/pgtable-hwdef.h>
@@ -39,7 +38,8 @@ static int wuwa_release(struct socket* sock) {
     return 0;
 }
 
-static int wuwa_ioctl(struct socket* sock, unsigned int cmd, unsigned long arg) {
+static int wuwa_ioctl(struct socket* sock, unsigned int cmd,
+                       unsigned long arg) {
     void __user* argp = (void __user*)arg;
 
     /* 调试：打印收到的命令号 */
@@ -49,9 +49,6 @@ static int wuwa_ioctl(struct socket* sock, unsigned int cmd, unsigned long arg) 
     for (i = 0; i < ARRAY_SIZE(ioctl_handlers); i++) {
         if (ioctl_handlers[i].cmd == 0)
             break; /* 哨兵 */
-
-        pr_info("[wuwa] checking handler[%d] cmd=%u vs %u\n",
-                i, ioctl_handlers[i].cmd, cmd);
 
         if (cmd == ioctl_handlers[i].cmd) {
             if (ioctl_handlers[i].handler == NULL) {
