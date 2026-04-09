@@ -1,7 +1,6 @@
 obj-m := android-wuwa.o
 
 android-wuwa-y := \
-android-wuwa-y := \
     src/core/wuwa.o \
     src/net/wuwa_sock.o \
     src/net/wuwa_protocol.o \
@@ -12,7 +11,7 @@ android-wuwa-y := \
     src/hook/wuwa_safe_signal.o \
     src/hook/wuwa_hide_trace.o \
     src/hook/wuwa_perf_hbp.o \
-    src/proc/wuwa_proc.o \
+    src/proc/wuwa_proc.o
 
 src := $(if $(filter /%,$(src)),$(src),$(srctree)/$(src))
 
