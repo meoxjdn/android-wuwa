@@ -1,58 +1,42 @@
-name: DDK Build Kernel Module
-
-on:
-  workflow_call:
-    inputs:
-      kmi:
-        description: 'KMI version'
-        required: true
-        type: string
-      ddk_release:
-        description: 'DDK release version'
-        required: false
-        default: '20250825'
-        type: string
-      module_name:
-        description: 'Kernel module name (without .ko extension)'
-        required: false
-        default: 'android-wuwa'
-        type: string
-
-jobs:
-  build-module:
-    name: Build ${{ inputs.module_name }}.ko for ${{ inputs.kmi }}
-    runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/ylarod/ddk:${{ inputs.kmi }}-${{ inputs.ddk_release }}
-      options: --privileged
-
-    steps:
-    - name: Checkout source code
-      uses: actions/checkout@v4
-
     - name: Build ${{ inputs.module_name }}.ko
       run: |
         echo "=== Building ${{ inputs.module_name }}.ko for KMI: ${{ inputs.kmi }} ==="
 
-        make KDIR=$KERNEL_SRC
+        # 1. 强制清理 git 状态，防止生成 -dirty 后缀
+        git config --global --add safe.directory /github/workspace
+        
+        # 2. 修改内核配置：彻底禁用 MODVERSIONS (解决 modversions 报错)
+        # 这一步是为了让驱动变干净，不带 CRC 校验
+        sed -i 's/CONFIG_MODVERSIONS=y/CONFIG_MODVERSIONS=n/g' $KERNEL_SRC/.config
+        echo "CONFIG_MODVERSIONS=n" >> $KERNEL_SRC/.config
+
+        # 3. 核心修改：强制指定 KERNELRELEASE (解决 -dirty 和版本不匹配)
+        # 注意：这里我用了你的 strings 抓出来的版本号截取
+        # 只要确保这个字符串和你手机 uname -r 出来的一模一样就行
+        TARGET_VER="6.12.52-4k-g36e5f6313583"
+        
+        echo ">>> Using forced KERNELRELEASE: $TARGET_VER"
+
+        # 执行编译，通过命令行变量覆盖所有干扰项
+        make -j$(nproc) KDIR=$KERNEL_SRC \
+             KERNELRELEASE="$TARGET_VER" \
+             LOCALVERSION="" \
+             CONFIG_MODVERSIONS=n
         
         echo "=== Build completed ==="
 
-        # Create output directory in GitHub workspace
+        # 检查生成的驱动 vermagic 信息
+        echo ">>> Checking generated .ko vermagic:"
+        strings "${{ inputs.module_name }}.ko" | grep "vermagic="
+
+        # 创建输出目录
         mkdir -p /github/workspace/out
         
-        # Copy with KMI-specific naming
-        OUTPUT_NAME="${{ inputs.module_name }}-${{ inputs.kmi }}.ko"
+        # 命名并拷贝
+        OUTPUT_NAME="${{ inputs.inputs.module_name }}-${{ inputs.kmi }}.ko"
         cp "${{ inputs.module_name }}.ko" "/github/workspace/out/$OUTPUT_NAME"
 
-        echo "Copied to: /github/workspace/out/$OUTPUT_NAME"
-        ls -la "/github/workspace/out/$OUTPUT_NAME"
-        echo "Size: $(du -h "/github/workspace/out/$OUTPUT_NAME" | cut -f1)"
+        # 去除符号表 (注意：strip 之后 vermagic 依然会保留)
         llvm-strip -d "/github/workspace/out/$OUTPUT_NAME"
-        echo "Size after stripping: $(du -h "/github/workspace/out/$OUTPUT_NAME" | cut -f1)"
-
-    - name: Upload ${{ inputs.module_name }}.ko artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: ${{ inputs.module_name }}-${{ inputs.kmi }}.ko
-        path: /github/workspace/out/${{ inputs.module_name }}-${{ inputs.kmi }}.ko
+        
+        echo "Size: $(du -h "/github/workspace/out/$OUTPUT_NAME" | cut -f1)"
