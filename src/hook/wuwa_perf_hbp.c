@@ -1,3 +1,5 @@
+/* wuwa_perf_hbp.c */
+#include "../ioctl/wuwa_ioctl.h"
 #include "wuwa_perf_hbp.h"
 #include <linux/perf_event.h>
 #include <linux/hw_breakpoint.h>
@@ -21,38 +23,23 @@
 #define OFF_PAUSE_JMP    0x53709a0ULL
 #define OFF_KILL         0x33b2ffcULL
 #define OFF_DAMAGE_STR   0x844f4c8ULL
-#define OFF_FOV_LDR      0xXXXXXXXULL  /* IDA确认：LDR S0, [PC, #8] 的地址 */
-#define OFF_FOV_POOL     (OFF_FOV_LDR + 8) /* 字面量池地址 */
+#define OFF_FOV_LDR      0xXXXXXXXULL  /* IDA确认：LDR S0,[PC,#8] 的地址 */
+#define OFF_FOV_POOL     (OFF_FOV_LDR + 8ULL)
 
 #define MAX_BPS          8
 #define FOV_TARGET       120.0f
 
 /* ================================================================
- * 请求结构体
- * ================================================================ */
-#pragma pack(push, 8)
-struct wuwa_hbp_req {
-    int      tid;
-    uint64_t base_addr;
-    int      fov_on;
-    int      border_on;
-    int      skip_on;
-    int      damage_on;
-    int      maxhp_on;
-};
-#pragma pack(pop)
-
-/* ================================================================
  * 全局状态
  * ================================================================ */
-static uint64_t          g_game_base   = 0;
+static uint64_t          g_game_base  = 0;
 static struct perf_event *g_bps[MAX_BPS];
-static int               g_bp_count    = 0;
-static int               g_fov_on      = 0;
-static int               g_border_on   = 0;
-static int               g_skip_on     = 0;
-static int               g_damage_on   = 0;
-static int               g_maxhp_on    = 0;
+static int               g_bp_count   = 0;
+static int               g_fov_on     = 0;
+static int               g_border_on  = 0;
+static int               g_skip_on    = 0;
+static int               g_damage_on  = 0;
+static int               g_maxhp_on   = 0;
 
 /* 卸载同步 */
 static DEFINE_MUTEX(g_bp_mutex);
@@ -81,7 +68,6 @@ typedef long (*write_nofault_fn_t)(
     const void *,
     size_t);
 
-/* fpsimd 操作函数指针 */
 typedef void (*fpsimd_save_fn_t)(struct user_fpsimd_state *);
 typedef void (*fpsimd_load_fn_t)(const struct user_fpsimd_state *);
 
@@ -97,8 +83,8 @@ static fpsimd_load_fn_t   fn_fpsimd_load   = NULL;
  * ================================================================ */
 static unsigned long resolve_symbol(const char *name)
 {
-    struct kprobe    kp;
-    unsigned long    addr = 0;
+    struct kprobe kp;
+    unsigned long addr = 0;
 
     memset(&kp, 0, sizeof(kp));
     kp.symbol_name = name;
@@ -132,10 +118,6 @@ static int resolve_all_symbols(void)
     fn_nofault_write = (write_nofault_fn_t)
         resolve_symbol("copy_to_user_nofault");
 
-    /*
-     * fpsimd 符号：不同内核版本名字不同
-     * 按优先级依次尝试
-     */
     fn_fpsimd_save = (fpsimd_save_fn_t)
         resolve_symbol("fpsimd_save_state");
     if (!fn_fpsimd_save)
@@ -214,8 +196,7 @@ static int fov_patch_literal_pool(uint64_t game_base, float fov)
 }
 
 /* ================================================================
- * FOV 路线三：fpsimd 直接操作（字面量池写保护时的备用方案）
- * 在断点 handler 里调用
+ * FOV 路线三：fpsimd 直接操作（字面量池写保护时备用）
  * ================================================================ */
 static void fov_handle_via_fpsimd(struct pt_regs *regs, float fov)
 {
@@ -223,18 +204,13 @@ static void fov_handle_via_fpsimd(struct pt_regs *regs, float fov)
     uint32_t                  bits;
 
     if (!fn_fpsimd_save || !fn_fpsimd_load) {
-        /*
-         * fpsimd 符号不可用
-         * 退化到什么都不做，FOV 不生效
-         * 不崩溃是第一优先级
-         */
         pr_warn_ratelimited("[wuwa] fpsimd 不可用，FOV 跳过\n");
         return;
     }
 
     fp = &current->thread.uw.fpsimd_state;
 
-    /* 把硬件寄存器刷到内存副本 */
+    /* 把硬件寄存器内容刷到内存副本 */
     fn_fpsimd_save(fp);
 
     /* 修改 V0 低 32 位（即 S0）*/
@@ -245,7 +221,7 @@ static void fov_handle_via_fpsimd(struct pt_regs *regs, float fov)
     /* 把修改后的副本写回硬件寄存器 */
     fn_fpsimd_load(fp);
 
-    /* 跳过 LDR S0, [PC, #8]，因为 S0 已经是我们想要的值 */
+    /* 跳过 LDR S0,[PC,#8]，S0 已经是目标值 */
     regs->pc += 4;
 }
 
@@ -259,25 +235,19 @@ static void wuwa_hbp_handler(struct perf_event       *bp,
     uint64_t pc;
     uint64_t base;
 
-    /* 卸载防护：设置了 shutting_down 就直接返回 */
     if (atomic_read(&g_shutting_down))
         return;
 
-    /*
-     * 增加引用计数
-     * 注意：inc 之后再次检查 shutting_down
-     * 防止在两次检查之间 cleanup 线程插入
-     */
     atomic_inc(&g_handler_active);
 
+    /* inc 之后再次检查，防止与 cleanup 的竞态窗口 */
     if (atomic_read(&g_shutting_down))
         goto out;
 
-    /* pt_regs 合法性 */
     if (!validate_regs(regs))
         goto out;
 
-    /* 单步异常过滤：防止 handler 被单步重复触发 */
+    /* 单步异常过滤 */
     if (regs->pstate & DBG_SPSR_SS)
         goto out;
 
@@ -286,7 +256,7 @@ static void wuwa_hbp_handler(struct perf_event       *bp,
 
     /* ----------------------------------------------------------------
      * 功能 1：去黑边
-     * 位置：函数入口，堆栈未压，直接 RET 安全
+     * 函数入口，堆栈未压，直接 RET 安全
      * ---------------------------------------------------------------- */
     if (g_border_on && pc == base + OFF_BORDER) {
         regs->regs[0] = 1;
@@ -296,7 +266,7 @@ static void wuwa_hbp_handler(struct perf_event       *bp,
 
     /* ----------------------------------------------------------------
      * 功能 2：秒过副本
-     * 位置：函数入口，修改跳转目标
+     * 函数入口，修改跳转目标
      * ---------------------------------------------------------------- */
     if (g_skip_on && pc == base + OFF_PAUSE_WIN) {
         regs->pc = base + OFF_PAUSE_JMP;
@@ -305,7 +275,7 @@ static void wuwa_hbp_handler(struct perf_event       *bp,
 
     /* ----------------------------------------------------------------
      * 功能 3：1血秒杀
-     * 位置：函数入口，堆栈未压，直接 RET 安全
+     * 函数入口，堆栈未压，直接 RET 安全
      * ---------------------------------------------------------------- */
     if (g_maxhp_on && pc == base + OFF_KILL) {
         regs->regs[0] = 1;
@@ -315,46 +285,25 @@ static void wuwa_hbp_handler(struct perf_event       *bp,
 
     /* ----------------------------------------------------------------
      * 功能 4：智能无敌
-     * 位置：STR W0, [X1, #0x2C]（伤害写回指令）
-     * 策略：
-     *   玩家（team_id == 0）→ pc += 4 跳过 STR，伤害不写入内存
-     *   敌人               → 不动，内核自动单步执行原 STR
+     * 位置：STR W0,[X1,#0x2C]（伤害写回指令）
+     * 玩家：pc += 4 跳过 STR，伤害不写入内存
+     * 敌人：不动，内核自动单步执行原 STR
      * ---------------------------------------------------------------- */
     if (g_damage_on && pc == base + OFF_DAMAGE_STR) {
-        uint32_t team_id = 1; /* 默认视为敌人 */
+        uint32_t team_id = 1;
 
-        if (regs->regs[1] != 0) {
-            /*
-             * 读取目标实体的 team_id
-             * safe_read_u32 内部用 copy_from_user_nofault
-             * 不会触发缺页，不会睡眠
-             */
+        if (regs->regs[1] != 0)
             safe_read_u32(regs->regs[1] + 0x1C, &team_id);
-        }
 
-        if (team_id == 0) {
-            /*
-             * 是玩家：跳过 STR
-             * STR W0, [X1, #0x2C] 是 offset 模式，无寄存器 writeback
-             * 跳过后 X0/X1 完好，后续指令正常运行
-             * 堆栈不受影响
-             */
+        if (team_id == 0)
             regs->pc += 4;
-        }
-        /* 敌人：什么都不改，内核单步执行原 STR */
+
         goto out;
     }
 
     /* ----------------------------------------------------------------
-     * 功能 5：全屏 FOV
-     * 位置：LDR S0, [PC, #8]
-     *
-     * 路线选择：
-     *   路线一（字面量池）在 install 阶段一次性写入，不需要断点
-     *   路线三（fpsimd）  在这里实时修改 S0
-     *
-     * 断点只在路线三时安装
-     * 路线一成功则跳过断点安装，此分支永远不会触发
+     * 功能 5：全屏 FOV（路线三断点方案）
+     * 路线一成功时此断点不会被安装，此分支永远不触发
      * ---------------------------------------------------------------- */
     if (g_fov_on && pc == base + OFF_FOV_LDR) {
         fov_handle_via_fpsimd(regs, FOV_TARGET);
@@ -362,7 +311,6 @@ static void wuwa_hbp_handler(struct perf_event       *bp,
     }
 
 out:
-    /* 引用计数归零时唤醒 cleanup 等待队列 */
     if (atomic_dec_and_test(&g_handler_active))
         wake_up_all(&g_handler_wq);
 }
@@ -432,7 +380,7 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req)
     if (ret)
         return ret;
 
-    /* 先清理上一次的残留断点 */
+    /* 先清理上一次残留 */
     wuwa_cleanup_perf_hbp();
 
     pid_struct = find_get_pid(req->tid);
@@ -446,7 +394,7 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req)
     }
 
     /* 更新全局状态 */
-    WRITE_ONCE(g_game_base, req->base_addr);
+    WRITE_ONCE(g_game_base,  req->base_addr);
     WRITE_ONCE(g_border_on,  req->border_on);
     WRITE_ONCE(g_skip_on,    req->skip_on);
     WRITE_ONCE(g_damage_on,  req->damage_on);
@@ -489,17 +437,10 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req)
 
     /* ---- 功能 5：全屏 FOV ---- */
     if (req->fov_on) {
-        /*
-         * 先尝试路线一：直接写字面量池
-         * 成功则不需要断点，零开销
-         */
+        /* 先试路线一：写字面量池，成功则不需要断点 */
         ret = fov_patch_literal_pool(req->base_addr, FOV_TARGET);
         if (ret != 0) {
-            /*
-             * 路线一失败（代码段写保护）
-             * 退到路线三：安装断点 + fpsimd 实时修改
-             */
-            pr_info("[wuwa] FOV 切换到路线三（fpsimd断点方案）\n");
+            pr_info("[wuwa] FOV 切换到路线三（fpsimd 断点方案）\n");
             fov_needs_bp = 1;
         }
 
@@ -514,10 +455,8 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req)
     cw = kmalloc(sizeof(*cw), GFP_KERNEL);
     if (cw) {
         init_task_work(&cw->work, wuwa_on_game_exit);
-        if (task_work_add(tsk, &cw->work, TWA_RESUME) != 0) {
-            /* task 已经在退出流程，直接释放 */
+        if (task_work_add(tsk, &cw->work, TWA_RESUME) != 0)
             kfree(cw);
-        }
     }
 
     mutex_unlock(&g_bp_mutex);
@@ -536,7 +475,7 @@ void wuwa_cleanup_perf_hbp(void)
     int                local_count;
     int                i;
 
-    /* Step 1：设置关闭标志，阻止新的 handler 进入 */
+    /* Step 1：阻止新的 handler 进入 */
     atomic_set(&g_shutting_down, 1);
     smp_mb();
 
@@ -545,18 +484,16 @@ void wuwa_cleanup_perf_hbp(void)
                        atomic_read(&g_handler_active) == 0,
                        msecs_to_jiffies(1000));
 
-    /*
-     * Step 3：把断点列表复制到栈上
-     * 持锁时间最短，避免在锁内调用可能睡眠的 unregister
-     */
+    /* Step 3：持锁最短时间，仅做列表复制 */
     mutex_lock(&g_bp_mutex);
     local_count = g_bp_count;
-    memcpy(local_bps, g_bps, sizeof(struct perf_event *) * local_count);
+    memcpy(local_bps, g_bps,
+           sizeof(struct perf_event *) * local_count);
     memset(g_bps, 0, sizeof(g_bps));
     g_bp_count = 0;
     mutex_unlock(&g_bp_mutex);
 
-    /* Step 4：在锁外卸载断点 */
+    /* Step 4：锁外卸载断点（unregister 内部可能睡眠）*/
     for (i = 0; i < local_count; i++) {
         if (local_bps[i] && fn_unregister) {
             fn_unregister(local_bps[i]);
