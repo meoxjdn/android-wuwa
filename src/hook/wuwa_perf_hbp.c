@@ -37,14 +37,17 @@ static struct perf_event *g_bps[MAX_BPS];
 static int g_bp_count = 0;
 static DEFINE_SPINLOCK(g_bp_lock);
 
+/* ===== 探针寻址函数指针定义 ===== */
 typedef struct perf_event *(*reg_user_hwbkpt_t)(struct perf_event_attr *attr,
                                                 perf_overflow_handler_t triggered,
                                                 void *context,
                                                 struct task_struct *tsk);
 typedef void (*unreg_hwbkpt_t)(struct perf_event *bp);
+typedef long (*cfun_t)(void *dst, const void __user *src, size_t size); // 定义无缺页拷贝
 
 static reg_user_hwbkpt_t fn_register = NULL;
 static unreg_hwbkpt_t fn_unregister = NULL;
+static cfun_t fn_nofault_read = NULL; // 存放安全的读取函数
 
 static unsigned long resolve_hidden_symbol(const char *name) {
     struct kprobe kp = { .symbol_name = name };
@@ -56,6 +59,7 @@ static unsigned long resolve_hidden_symbol(const char *name) {
     return addr;
 }
 
+/* ===== 硬件断点内核回调 (这里绝对不能有任何会休眠的代码) ===== */
 static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
     uint64_t pc = regs->pc;
 
@@ -72,9 +76,14 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
     if (g_damage_on && pc == g_game_base + OFF_DAMAGE) {
         uint32_t flag = 0;
         uint64_t target_addr = regs->regs[1] + 0x1c;
-        if (copy_from_user(&flag, (void __user *)target_addr, 4) == 0) {
-            if (flag == 1) return; 
+        
+        // 使用探针挖出来的安全读取函数，绝对不会引发 Kernel Panic 死机！
+        if (fn_nofault_read) {
+            if (fn_nofault_read(&flag, (void __user *)target_addr, 4) == 0) {
+                if (flag == 1) return; // 放行原指令
+            }
         }
+        
         regs->regs[0] = 1;
         regs->pc = regs->regs[30];
         return;
@@ -105,7 +114,6 @@ static struct perf_event *install_bp(struct task_struct *tsk, uint64_t addr) {
     return bp;
 }
 
-/* ===== 通信入口：修复 errno 14 的双重拷贝问题 ===== */
 int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     struct task_struct *tsk;
     struct perf_event *bp;
@@ -113,15 +121,20 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
 
     if (!req) return -EINVAL;
 
-    if (!fn_register || !fn_unregister) {
+    // 初始化时一并挖出 copy_from_user_nofault
+    if (!fn_register || !fn_unregister || !fn_nofault_read) {
         fn_register = (reg_user_hwbkpt_t)resolve_hidden_symbol("register_user_hw_breakpoint");
         fn_unregister = (unreg_hwbkpt_t)resolve_hidden_symbol("unregister_hw_breakpoint");
+        fn_nofault_read = (cfun_t)resolve_hidden_symbol("copy_from_user_nofault");
+        
+        // 兼容更旧或更新的内核命名
+        if (!fn_nofault_read) fn_nofault_read = (cfun_t)resolve_hidden_symbol("probe_kernel_read");
+
         if (!fn_register || !fn_unregister) {
             return -ENOSYS;
         }
     }
 
-    // 【核心修复】req 已经是安全的内核指针了，直接读，绝不 copy_from_user！
     g_game_base = req->base_addr;
     g_border_on = req->border_on;
     g_skip_on = req->skip_on;
