@@ -4,19 +4,23 @@ on:
   workflow_call:
     inputs:
       kmi:
+        description: 'KMI version'
         required: true
         type: string
       ddk_release:
+        description: 'DDK release version'
         required: false
-        default: '20251016'
+        default: '20250825'
         type: string
       module_name:
+        description: 'Kernel module name (without .ko extension)'
         required: false
         default: 'android-wuwa'
         type: string
 
 jobs:
   build-module:
+    name: Build ${{ inputs.module_name }}.ko for ${{ inputs.kmi }}
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/ylarod/ddk:${{ inputs.kmi }}-${{ inputs.ddk_release }}
@@ -28,46 +32,27 @@ jobs:
 
     - name: Build ${{ inputs.module_name }}.ko
       run: |
-        echo "=== 正在为内核版本 ${{ inputs.kmi }} 强行编译驱动 ==="
+        echo "=== Building ${{ inputs.module_name }}.ko for KMI: ${{ inputs.kmi }} ==="
 
-        # 1. 解决 git 目录权限问题，防止生成 -dirty 后缀
-        git config --global --add safe.directory /github/workspace
+        make KDIR=$KERNEL_SRC
         
-        # 2. 彻底禁用符号版本校验 (解决 modversions 报错)
-        # 强行修改内核配置，确保不带 CRC 校验码
-        if [ -f $KERNEL_SRC/.config ]; then
-          sed -i 's/CONFIG_MODVERSIONS=y/CONFIG_MODVERSIONS=n/g' $KERNEL_SRC/.config
-          echo "CONFIG_MODVERSIONS=n" >> $KERNEL_SRC/.config
-        fi
+        echo "=== Build completed ==="
 
-        # 3. 强行对齐内核版本号 (解决 -dirty 和版本不匹配)
-        # 这里使用你 strings 抓出来的精确字符串
-        TARGET_VER="6.12.52-4k-g36e5f6313583"
-        echo ">>> 强行注入 Vermagic: $TARGET_VER"
-
-        # 执行编译：覆盖 KERNELRELEASE 变量是成功的关键
-        make -j$(nproc) KDIR=$KERNEL_SRC \
-             KERNELRELEASE="$TARGET_VER" \
-             LOCALVERSION="" \
-             CONFIG_MODVERSIONS=n
-        
-        echo "=== 编译完成 ==="
-
-        # 验证生成的驱动 vermagic 是否干净
-        echo ">>> 检查生成的驱动身份证:"
-        strings "${{ inputs.module_name }}.ko" | grep "vermagic="
-
-        # 创建输出目录并拷贝
+        # Create output directory in GitHub workspace
         mkdir -p /github/workspace/out
+        
+        # Copy with KMI-specific naming
         OUTPUT_NAME="${{ inputs.module_name }}-${{ inputs.kmi }}.ko"
         cp "${{ inputs.module_name }}.ko" "/github/workspace/out/$OUTPUT_NAME"
 
-        # 移除调试符号减少体积
+        echo "Copied to: /github/workspace/out/$OUTPUT_NAME"
+        ls -la "/github/workspace/out/$OUTPUT_NAME"
+        echo "Size: $(du -h "/github/workspace/out/$OUTPUT_NAME" | cut -f1)"
         llvm-strip -d "/github/workspace/out/$OUTPUT_NAME"
-        echo "Final Size: $(du -h "/github/workspace/out/$OUTPUT_NAME" | cut -f1)"
+        echo "Size after stripping: $(du -h "/github/workspace/out/$OUTPUT_NAME" | cut -f1)"
 
-    - name: Upload Artifact
+    - name: Upload ${{ inputs.module_name }}.ko artifact
       uses: actions/upload-artifact@v4
       with:
-        name: ${{ inputs.module_name }}-${{ inputs.kmi }}
-        path: /github/workspace/out/*.ko
+        name: ${{ inputs.module_name }}-${{ inputs.kmi }}.ko
+        path: /github/workspace/out/${{ inputs.module_name }}-${{ inputs.kmi }}.ko
