@@ -6,13 +6,16 @@
 #include <linux/sched.h>
 #include <linux/pid.h>
 #include <linux/kprobes.h>
-#include <linux/mutex.h> // 引入安全的互斥锁
+#include <linux/mutex.h> // 绝对安全的互斥锁
 
 /* ===== 游戏核心偏移 ===== */
 #define OFF_BORDER   0x8951160
 #define OFF_SKIP     0x2639fd8
 #define OFF_SKIP_JMP 0x53709a0
-#define OFF_DAMAGE   0x844f4b4
+
+/* 【核心修改】将无敌断点下移到安全的 MOV X19, X1 指令处 (原偏移 0x844f4b4 + 0x1C) */
+#define OFF_DAMAGE   0x844f4d0 
+
 #define OFF_MAXHP    0x33b2ffc
 
 #pragma pack(push, 8)
@@ -37,7 +40,7 @@ static int g_maxhp_on = 0;
 static struct perf_event *g_bps[MAX_BPS];
 static int g_bp_count = 0;
 
-/* 【核心修复】将 spinlock 改为 mutex，允许在安装断点时合法休眠，彻底告别手机死机！ */
+/* 安全互斥锁，防止安装断点时内核崩溃 */
 static DEFINE_MUTEX(g_bp_mutex);
 
 typedef struct perf_event *(*reg_user_hwbkpt_t)(struct perf_event_attr *attr,
@@ -51,6 +54,7 @@ static reg_user_hwbkpt_t fn_register = NULL;
 static unreg_hwbkpt_t fn_unregister = NULL;
 static cfun_t fn_nofault_read = NULL;
 
+/* Kprobe 内存探针寻址引擎 */
 static unsigned long resolve_hidden_symbol(const char *name) {
     struct kprobe kp = { .symbol_name = name };
     unsigned long addr = 0;
@@ -61,7 +65,7 @@ static unsigned long resolve_hidden_symbol(const char *name) {
     return addr;
 }
 
-/* ===== 硬件断点内核回调 (硬中断上下文，绝对禁止休眠) ===== */
+/* ===== 硬件断点内核回调 (硬中断上下文) ===== */
 static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
     uint64_t pc = regs->pc;
 
@@ -75,16 +79,25 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
         return;
     }
 
+    /* 【核心修复】无敌/伤害的稳定版拦截逻辑 */
     if (g_damage_on && pc == g_game_base + OFF_DAMAGE) {
         uint32_t flag = 0;
+        // 此时 X1 依然是你的对象指针
         uint64_t target_addr = regs->regs[1] + 0x1c;
         
-        // 使用探针挖出的安全读取 API，不会引发缺页中断死机
         if (fn_nofault_read) {
             if (fn_nofault_read(&flag, (void __user *)target_addr, 4) == 0) {
-                if (flag == 1) return; // 放行原指令
+                if (flag == 1) {
+                    /* 需要放行：因为我们拦截的是 MOV X19, X1，必须帮它完成这步操作！ */
+                    regs->regs[19] = regs->regs[1]; 
+                    /* 强行把 PC 往下移，跳过这条指令，打破死循环！ */
+                    regs->pc += 4; 
+                    return;
+                }
             }
         }
+        
+        /* 正常秒杀/无敌修改，提前返回，直接绕过整个函数的运算 */
         regs->regs[0] = 1;
         regs->pc = regs->regs[30];
         return;
@@ -149,7 +162,6 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
         return -ESRCH;
     }
 
-    // 【核心修复】获取安全的 Mutex 锁，允许内部睡眠分配内存
     mutex_lock(&g_bp_mutex);
     if (req->border_on && g_bp_count < MAX_BPS) {
         bp = install_bp(tsk, g_game_base + OFF_BORDER);
