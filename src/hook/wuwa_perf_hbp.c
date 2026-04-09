@@ -1,4 +1,3 @@
-/* wuwa_perf_hbp.c */
 #include "../ioctl/wuwa_ioctl.h"
 #include "wuwa_perf_hbp.h"
 #include <linux/perf_event.h>
@@ -20,29 +19,28 @@
 /* ================================================================
  * 偏移定义
  * ================================================================ */
-#define OFF_BORDER      0x8951160ULL   /* 去黑边：函数入口 */
-#define OFF_PAUSE_WIN   0x2639fd8ULL   /* 秒过副本：函数入口 */
-#define OFF_PAUSE_JMP   0x53709a0ULL   /* 秒过跳转目标 */
-#define OFF_KILL        0x33b2ffcULL   /* 1血秒杀：函数入口 */
-#define OFF_DAMAGE      0x844f4b4ULL   /* 无敌：函数入口 */
-#define OFF_FOV         0x9326F78ULL   /* 全屏：函数入口 */
+#define OFF_BORDER      0x8951160ULL
+#define OFF_PAUSE_WIN   0x2639fd8ULL
+#define OFF_PAUSE_JMP   0x53709a0ULL
+#define OFF_KILL        0x33b2ffcULL
+#define OFF_DAMAGE      0x844f4b4ULL
+#define OFF_FOV         0x9326F78ULL
 
 #define MAX_BPS         8
 
 /*
- * 4.3f 的 IEEE 754 位模式
+ * 4.3f = 0x4089999A
  * python3: hex(struct.unpack('I', struct.pack('f', 4.3))[0])
- * = 0x4089999a
  */
 #define FOV_TARGET_BITS 0x4089999AU
 
 /* ================================================================
- * TWA 兼容
+ * TWA 版本兼容
  * ================================================================ */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
-  #define WUWA_TWA  TWA_SIGNAL
+    #define WUWA_TWA TWA_SIGNAL
 #else
-  #define WUWA_TWA  TWA_RESUME
+    #define WUWA_TWA TWA_RESUME
 #endif
 
 /* ================================================================
@@ -63,20 +61,28 @@ static atomic_t          g_shutting_down  = ATOMIC_INIT(0);
 static DECLARE_WAIT_QUEUE_HEAD(g_handler_wq);
 
 /* ================================================================
- * 函数指针
+ * 函数指针定义
  * ================================================================ */
 typedef struct perf_event *(*reg_fn_t)(
     struct perf_event_attr *,
     perf_overflow_handler_t,
     void *,
     struct task_struct *);
+
 typedef void (*unreg_fn_t)(struct perf_event *);
-typedef long (*read_nofault_fn_t)(void *, const void __user *, size_t);
+
+typedef long (*read_nofault_fn_t)(
+    void *,
+    const void __user *,
+    size_t);
+
 typedef void (*fpsimd_save_fn_t)(struct user_fpsimd_state *);
 typedef void (*fpsimd_load_fn_t)(const struct user_fpsimd_state *);
-typedef int  (*task_work_add_fn_t)(struct task_struct *,
-                                    struct callback_head *,
-                                    enum task_work_notify_mode);
+
+typedef int (*task_work_add_fn_t)(
+    struct task_struct *,
+    struct callback_head *,
+    enum task_work_notify_mode);
 
 static reg_fn_t           fn_register      = NULL;
 static unreg_fn_t         fn_unregister    = NULL;
@@ -112,6 +118,7 @@ static int resolve_all_symbols(void)
 
     fn_register = (reg_fn_t)
         resolve_symbol("register_user_hw_breakpoint");
+
     fn_unregister = (unreg_fn_t)
         resolve_symbol("unregister_hw_breakpoint");
 
@@ -144,7 +151,7 @@ static int resolve_all_symbols(void)
     if (!fn_nofault_read)
         pr_warn("[wuwa] 内存安全读取不可用\n");
     if (!fn_fpsimd_save || !fn_fpsimd_load)
-        pr_warn("[wuwa] fpsimd 不可用，全屏将退化为直接RET\n");
+        pr_warn("[wuwa] fpsimd 不可用，FOV 退化为阻止函数执行\n");
     if (!fn_task_work_add)
         pr_warn("[wuwa] task_work_add 不可用，退出钩子禁用\n");
 
@@ -168,14 +175,14 @@ static inline int safe_read_u32(uint64_t addr, uint32_t *out)
  * ================================================================ */
 static inline int validate_regs(struct pt_regs *regs)
 {
-    if (unlikely(!regs))       return 0;
-    if (!user_mode(regs))      return 0;
-    if (regs->pc & 0x3)        return 0;
+    if (unlikely(!regs))  return 0;
+    if (!user_mode(regs)) return 0;
+    if (regs->pc & 0x3)   return 0;
     return 1;
 }
 
 /* ================================================================
- * 全屏 FOV：fpsimd 设置 S0 后 RET
+ * 全屏 FOV 处理
  * 断点在函数入口，STR 还没执行，X30 是真实 LR
  * ================================================================ */
 static void handle_fov(struct pt_regs *regs)
@@ -183,23 +190,15 @@ static void handle_fov(struct pt_regs *regs)
     if (fn_fpsimd_save && fn_fpsimd_load) {
         struct user_fpsimd_state *fp = &current->thread.uw.fpsimd_state;
 
-        /* 刷硬件寄存器到内存 */
         fn_fpsimd_save(fp);
 
-        /* 设置 S0 = 4.3f */
-        fp->vregs[0] = (fp->vregs[0] & ~((__uint128_t)0xFFFFFFFFULL)) |
-                       (__uint128_t)FOV_TARGET_BITS;
+        fp->vregs[0] =
+            (fp->vregs[0] & ~((__uint128_t)0xFFFFFFFFULL)) |
+            (__uint128_t)FOV_TARGET_BITS;
 
-        /* 写回硬件 */
         fn_fpsimd_load(fp);
     }
 
-    /*
-     * 无论 fpsimd 是否可用，都直接 RET
-     * 让这个函数完全不执行，游戏引擎读到的 FOV 由上层决定
-     * fpsimd 可用时：S0 已经被我们设置好了
-     * fpsimd 不可用时：退化为阻止函数执行，效果取决于调用方
-     */
     regs->pc = regs->regs[30];
 }
 
@@ -224,51 +223,33 @@ static void wuwa_hbp_handler(struct perf_event       *bp,
     if (!validate_regs(regs))
         goto out;
 
-    /* 单步异常过滤 */
     if (regs->pstate & DBG_SPSR_SS)
         goto out;
 
     pc   = regs->pc;
     base = READ_ONCE(g_game_base);
 
-    /* ----------------------------------------------------------------
-     * 去黑边
-     * 函数入口，堆栈未压，直接 RET
-     * ---------------------------------------------------------------- */
+    /* 去黑边 */
     if (g_border_on && pc == base + OFF_BORDER) {
         regs->regs[0] = 1;
         regs->pc      = regs->regs[30];
         goto out;
     }
 
-    /* ----------------------------------------------------------------
-     * 秒过副本
-     * 函数入口，修改跳转目标
-     * ---------------------------------------------------------------- */
+    /* 秒过副本 */
     if (g_skip_on && pc == base + OFF_PAUSE_WIN) {
         regs->pc = base + OFF_PAUSE_JMP;
         goto out;
     }
 
-    /* ----------------------------------------------------------------
-     * 1血秒杀
-     * 函数入口，堆栈未压，直接 RET
-     * ---------------------------------------------------------------- */
+    /* 1血秒杀 */
     if (g_maxhp_on && pc == base + OFF_KILL) {
         regs->regs[0] = 1;
         regs->pc      = regs->regs[30];
         goto out;
     }
 
-    /* ----------------------------------------------------------------
-     * 智能无敌
-     * 函数入口 0x844f4b4，STP 还没执行
-     * X0 = 伤害值相关，X1 = 目标实体指针
-     * X30 = 真实返回地址
-     *
-     * 玩家（team_id == 0）：强制返回 1，RET
-     * 敌人：什么都不改，内核单步执行原 STP，正常走
-     * ---------------------------------------------------------------- */
+    /* 智能无敌 */
     if (g_damage_on && pc == base + OFF_DAMAGE) {
         uint32_t team_id = 1;
 
@@ -282,11 +263,7 @@ static void wuwa_hbp_handler(struct perf_event       *bp,
         goto out;
     }
 
-    /* ----------------------------------------------------------------
-     * 全屏 FOV
-     * 函数入口 0x9326F78，STR 还没执行
-     * X30 = 真实返回地址
-     * ---------------------------------------------------------------- */
+    /* 全屏 FOV */
     if (g_fov_on && pc == base + OFF_FOV) {
         handle_fov(regs);
         goto out;
@@ -337,6 +314,7 @@ static void wuwa_on_game_exit(struct callback_head *work)
 {
     struct wuwa_cleanup_work *cw =
         container_of(work, struct wuwa_cleanup_work, work);
+
     pr_info("[wuwa] 游戏退出，自动清理断点\n");
     wuwa_cleanup_perf_hbp();
     kfree(cw);
@@ -344,6 +322,8 @@ static void wuwa_on_game_exit(struct callback_head *work)
 
 /* ================================================================
  * 外部接口：安装
+ * 注意：不在这里调用 wuwa_cleanup_perf_hbp()
+ * 清理由用户态主动调用或游戏退出时自动触发
  * ================================================================ */
 int wuwa_install_perf_hbp(struct wuwa_hbp_req *req)
 {
@@ -359,8 +339,6 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req)
     ret = resolve_all_symbols();
     if (ret)
         return ret;
-
-    wuwa_cleanup_perf_hbp();
 
     pid_struct = find_get_pid(req->tid);
     if (!pid_struct)
@@ -384,31 +362,26 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req)
 
     mutex_lock(&g_bp_mutex);
 
-    /* 去黑边 */
     if (req->border_on && g_bp_count < MAX_BPS) {
         bp = install_bp(tsk, req->base_addr + OFF_BORDER);
         if (bp) g_bps[g_bp_count++] = bp;
     }
 
-    /* 秒过副本 */
     if (req->skip_on && g_bp_count < MAX_BPS) {
         bp = install_bp(tsk, req->base_addr + OFF_PAUSE_WIN);
         if (bp) g_bps[g_bp_count++] = bp;
     }
 
-    /* 1血秒杀 */
     if (req->maxhp_on && g_bp_count < MAX_BPS) {
         bp = install_bp(tsk, req->base_addr + OFF_KILL);
         if (bp) g_bps[g_bp_count++] = bp;
     }
 
-    /* 无敌 */
     if (req->damage_on && g_bp_count < MAX_BPS) {
         bp = install_bp(tsk, req->base_addr + OFF_DAMAGE);
         if (bp) g_bps[g_bp_count++] = bp;
     }
 
-    /* 全屏 FOV */
     if (req->fov_on && g_bp_count < MAX_BPS) {
         bp = install_bp(tsk, req->base_addr + OFF_FOV);
         if (bp) g_bps[g_bp_count++] = bp;
