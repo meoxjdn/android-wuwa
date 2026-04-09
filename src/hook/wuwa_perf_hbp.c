@@ -6,14 +6,13 @@
 #include <linux/sched.h>
 #include <linux/pid.h>
 
-/* ===== 游戏核心偏移 (从你的 Ptrace 工具中移植) ===== */
+/* ===== 游戏核心偏移 ===== */
 #define OFF_BORDER   0x8951160
 #define OFF_SKIP     0x2639fd8
 #define OFF_SKIP_JMP 0x53709a0
 #define OFF_DAMAGE   0x844f4b4
 #define OFF_MAXHP    0x33b2ffc
 
-/* 与 C++ 端严格对应的结构体 (8字节对齐) */
 #pragma pack(push, 8)
 struct wuwa_hbp_req {
     int tid;
@@ -26,7 +25,6 @@ struct wuwa_hbp_req {
 };
 #pragma pack(pop)
 
-/* ===== 全局状态配置 ===== */
 static uint64_t g_game_base = 0;
 static int g_border_on = 0;
 static int g_skip_on = 0;
@@ -38,39 +36,27 @@ static struct perf_event *g_bps[MAX_BPS];
 static int g_bp_count = 0;
 static DEFINE_SPINLOCK(g_bp_lock);
 
-/* 安全内存读取，防止 copy_from_user 导致中断休眠死机 */
-static int safe_read_u32(uint64_t addr, uint32_t *val) {
-    int ret;
-    pagefault_disable();
-    ret = __get_user(*val, (uint32_t __user *)addr);
-    pagefault_enable();
-    return ret;
-}
-
-/* ===== 硬件断点内核回调 (核心劫持逻辑) ===== */
+/* ===== 硬件断点内核回调 ===== */
 static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
     uint64_t pc = regs->pc;
 
-    // 1. 副本秒过 (Skip)
     if (g_skip_on && pc == g_game_base + OFF_SKIP) {
         regs->pc = g_game_base + OFF_SKIP_JMP;
         return;
     }
 
-    // 2. 去黑边 (Border)
     if (g_border_on && pc == g_game_base + OFF_BORDER) {
         regs->pc = regs->regs[30]; 
         return;
     }
 
-    // 3. 副本全秒/伤害 (Damage)
     if (g_damage_on && pc == g_game_base + OFF_DAMAGE) {
         uint32_t flag = 0;
         uint64_t target_addr = regs->regs[1] + 0x1c;
         
-        if (safe_read_u32(target_addr, &flag) == 0) {
+        // 退回已经被验证能成功过检的 copy_from_user
+        if (copy_from_user(&flag, (void __user *)target_addr, 4) == 0) {
             if (flag == 1) {
-                /* 内核自动单步跳过并放行 */
                 return; 
             }
         }
@@ -79,7 +65,6 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
         return;
     }
 
-    // 4. 副本最大血量 (MaxHP)
     if (g_maxhp_on && pc == g_game_base + OFF_MAXHP) {
         regs->regs[0] = 1;
         regs->pc = regs->regs[30];
@@ -87,7 +72,6 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
     }
 }
 
-/* ===== 安装单个断点 ===== */
 static struct perf_event *install_bp(struct task_struct *tsk, uint64_t addr) {
     struct perf_event_attr attr;
     struct perf_event *bp;
@@ -104,14 +88,12 @@ static struct perf_event *install_bp(struct task_struct *tsk, uint64_t addr) {
     return bp;
 }
 
-/* ===== 与 C++ 工具通信的入口 (已修复类型冲突) ===== */
 int wuwa_install_perf_hbp(struct wuwa_hbp_req *user_req) {
     struct wuwa_hbp_req req;
     struct task_struct *tsk;
     struct perf_event *bp;
     struct pid *pid_struct;
 
-    // 将用户态指针强制转换读取，匹配头文件声明
     if (copy_from_user(&req, (void __user *)user_req, sizeof(req))) {
         return -EFAULT;
     }
@@ -154,7 +136,6 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *user_req) {
     return 0; 
 }
 
-/* ===== 清理函数 ===== */
 void wuwa_cleanup_perf_hbp(void) {
     int i;
     spin_lock(&g_bp_lock);
