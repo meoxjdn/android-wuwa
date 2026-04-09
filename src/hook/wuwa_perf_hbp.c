@@ -26,11 +26,14 @@
 #define OFF_DAMAGE      0x844f4b4ULL
 #define OFF_FOV         0x9326F78ULL
 
-#define MAX_BPS         8
+/*
+ * 每个线程装5个断点
+ * 最多支持 32 个线程：32 × 5 = 160
+ */
+#define MAX_BPS         160
 
 /*
  * 4.3f = 0x4089999A
- * python3: hex(struct.unpack('I', struct.pack('f', 4.3))[0])
  */
 #define FOV_TARGET_BITS 0x4089999AU
 
@@ -151,9 +154,9 @@ static int resolve_all_symbols(void)
     if (!fn_nofault_read)
         pr_warn("[wuwa] 内存安全读取不可用\n");
     if (!fn_fpsimd_save || !fn_fpsimd_load)
-        pr_warn("[wuwa] fpsimd 不可用，FOV 退化为阻止函数执行\n");
+        pr_warn("[wuwa] fpsimd 不可用\n");
     if (!fn_task_work_add)
-        pr_warn("[wuwa] task_work_add 不可用，退出钩子禁用\n");
+        pr_warn("[wuwa] task_work_add 不可用\n");
 
     return 0;
 }
@@ -183,22 +186,17 @@ static inline int validate_regs(struct pt_regs *regs)
 
 /* ================================================================
  * 全屏 FOV 处理
- * 断点在函数入口，STR 还没执行，X30 是真实 LR
  * ================================================================ */
 static void handle_fov(struct pt_regs *regs)
 {
     if (fn_fpsimd_save && fn_fpsimd_load) {
         struct user_fpsimd_state *fp = &current->thread.uw.fpsimd_state;
-
         fn_fpsimd_save(fp);
-
         fp->vregs[0] =
             (fp->vregs[0] & ~((__uint128_t)0xFFFFFFFFULL)) |
             (__uint128_t)FOV_TARGET_BITS;
-
         fn_fpsimd_load(fp);
     }
-
     regs->pc = regs->regs[30];
 }
 
@@ -231,8 +229,7 @@ static void wuwa_hbp_handler(struct perf_event       *bp,
 
     /* 去黑边 */
     if (g_border_on && pc == base + OFF_BORDER) {
-        regs->regs[0] = 1;
-        regs->pc      = regs->regs[30];
+        regs->pc = regs->regs[30];
         goto out;
     }
 
@@ -251,15 +248,17 @@ static void wuwa_hbp_handler(struct perf_event       *bp,
 
     /* 智能无敌 */
     if (g_damage_on && pc == base + OFF_DAMAGE) {
-        uint32_t team_id = 1;
-
-        if (regs->regs[1] != 0)
-            safe_read_u32(regs->regs[1] + 0x1C, &team_id);
-
-        if (team_id == 0) {
-            regs->regs[0] = 1;
-            regs->pc      = regs->regs[30];
+        if (regs->regs[1] != 0) {
+            uint32_t team_id = 1;
+            if (safe_read_u32(regs->regs[1] + 0x1C, &team_id) == 0) {
+                if (team_id == 0) {
+                    regs->regs[0] = 1;
+                    regs->pc      = regs->regs[30];
+                    goto out;
+                }
+            }
         }
+        /* 敌人或读取失败：什么都不做，内核自动单步放行 */
         goto out;
     }
 
@@ -314,7 +313,6 @@ static void wuwa_on_game_exit(struct callback_head *work)
 {
     struct wuwa_cleanup_work *cw =
         container_of(work, struct wuwa_cleanup_work, work);
-
     pr_info("[wuwa] 游戏退出，自动清理断点\n");
     wuwa_cleanup_perf_hbp();
     kfree(cw);
@@ -322,8 +320,11 @@ static void wuwa_on_game_exit(struct callback_head *work)
 
 /* ================================================================
  * 外部接口：安装
- * 注意：不在这里调用 wuwa_cleanup_perf_hbp()
- * 清理由用户态主动调用或游戏退出时自动触发
+ *
+ * 核心设计：
+ * 每次调用追加断点，不清理之前的
+ * 用户态对每个线程调用一次，所有线程都装上断点
+ * handler 里用全局开关判断功能是否开启
  * ================================================================ */
 int wuwa_install_perf_hbp(struct wuwa_hbp_req *req)
 {
@@ -332,6 +333,7 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req)
     struct wuwa_cleanup_work *cw;
     struct perf_event        *bp;
     int                       ret;
+    bool                      first_call;
 
     if (!req)
         return -EINVAL;
@@ -350,59 +352,74 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req)
         return -ESRCH;
     }
 
-    WRITE_ONCE(g_game_base, req->base_addr);
-    WRITE_ONCE(g_border_on, req->border_on);
-    WRITE_ONCE(g_skip_on,   req->skip_on);
-    WRITE_ONCE(g_damage_on, req->damage_on);
-    WRITE_ONCE(g_maxhp_on,  req->maxhp_on);
-    WRITE_ONCE(g_fov_on,    req->fov_on);
-
-    atomic_set(&g_shutting_down, 0);
-    smp_mb();
-
     mutex_lock(&g_bp_mutex);
 
+    /*
+     * 第一次调用时初始化全局状态
+     * 后续调用只追加断点，不重置状态
+     */
+    first_call = (g_bp_count == 0);
+
+    if (first_call) {
+        WRITE_ONCE(g_game_base, req->base_addr);
+        WRITE_ONCE(g_border_on, req->border_on);
+        WRITE_ONCE(g_skip_on,   req->skip_on);
+        WRITE_ONCE(g_damage_on, req->damage_on);
+        WRITE_ONCE(g_maxhp_on,  req->maxhp_on);
+        WRITE_ONCE(g_fov_on,    req->fov_on);
+        atomic_set(&g_shutting_down, 0);
+        smp_mb();
+    }
+
+    /* 去黑边 */
     if (req->border_on && g_bp_count < MAX_BPS) {
         bp = install_bp(tsk, req->base_addr + OFF_BORDER);
         if (bp) g_bps[g_bp_count++] = bp;
     }
 
+    /* 秒过副本 */
     if (req->skip_on && g_bp_count < MAX_BPS) {
         bp = install_bp(tsk, req->base_addr + OFF_PAUSE_WIN);
         if (bp) g_bps[g_bp_count++] = bp;
     }
 
+    /* 1血秒杀 */
     if (req->maxhp_on && g_bp_count < MAX_BPS) {
         bp = install_bp(tsk, req->base_addr + OFF_KILL);
         if (bp) g_bps[g_bp_count++] = bp;
     }
 
+    /* 无敌 */
     if (req->damage_on && g_bp_count < MAX_BPS) {
         bp = install_bp(tsk, req->base_addr + OFF_DAMAGE);
         if (bp) g_bps[g_bp_count++] = bp;
     }
 
+    /* 全屏 FOV */
     if (req->fov_on && g_bp_count < MAX_BPS) {
         bp = install_bp(tsk, req->base_addr + OFF_FOV);
         if (bp) g_bps[g_bp_count++] = bp;
     }
 
-    /* 进程退出钩子 */
-    cw = kmalloc(sizeof(*cw), GFP_KERNEL);
-    if (cw) {
-        init_task_work(&cw->work, wuwa_on_game_exit);
-        if (fn_task_work_add) {
-            if (fn_task_work_add(tsk, &cw->work, WUWA_TWA) != 0)
+    /* 进程退出钩子只挂一次（第一次调用时）*/
+    if (first_call) {
+        cw = kmalloc(sizeof(*cw), GFP_KERNEL);
+        if (cw) {
+            init_task_work(&cw->work, wuwa_on_game_exit);
+            if (fn_task_work_add) {
+                if (fn_task_work_add(tsk, &cw->work, WUWA_TWA) != 0)
+                    kfree(cw);
+            } else {
                 kfree(cw);
-        } else {
-            kfree(cw);
+            }
         }
     }
 
     mutex_unlock(&g_bp_mutex);
     put_pid(pid_struct);
 
-    pr_info("[wuwa] 安装完成，共 %d 个断点\n", g_bp_count);
+    pr_info("[wuwa] TID %d 安装完成，当前断点总数 %d\n",
+            req->tid, g_bp_count);
     return 0;
 }
 
