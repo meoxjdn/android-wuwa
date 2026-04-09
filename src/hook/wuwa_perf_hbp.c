@@ -5,7 +5,8 @@
 #include <linux/slab.h>
 #include <linux/sched.h>
 #include <linux/pid.h>
-#include <linux/kprobes.h> 
+#include <linux/kprobes.h>
+#include <linux/mutex.h> // 引入安全的互斥锁
 
 /* ===== 游戏核心偏移 ===== */
 #define OFF_BORDER   0x8951160
@@ -35,19 +36,20 @@ static int g_maxhp_on = 0;
 #define MAX_BPS 512
 static struct perf_event *g_bps[MAX_BPS];
 static int g_bp_count = 0;
-static DEFINE_SPINLOCK(g_bp_lock);
 
-/* ===== 探针寻址函数指针定义 ===== */
+/* 【核心修复】将 spinlock 改为 mutex，允许在安装断点时合法休眠，彻底告别手机死机！ */
+static DEFINE_MUTEX(g_bp_mutex);
+
 typedef struct perf_event *(*reg_user_hwbkpt_t)(struct perf_event_attr *attr,
                                                 perf_overflow_handler_t triggered,
                                                 void *context,
                                                 struct task_struct *tsk);
 typedef void (*unreg_hwbkpt_t)(struct perf_event *bp);
-typedef long (*cfun_t)(void *dst, const void __user *src, size_t size); // 定义无缺页拷贝
+typedef long (*cfun_t)(void *dst, const void __user *src, size_t size);
 
 static reg_user_hwbkpt_t fn_register = NULL;
 static unreg_hwbkpt_t fn_unregister = NULL;
-static cfun_t fn_nofault_read = NULL; // 存放安全的读取函数
+static cfun_t fn_nofault_read = NULL;
 
 static unsigned long resolve_hidden_symbol(const char *name) {
     struct kprobe kp = { .symbol_name = name };
@@ -59,7 +61,7 @@ static unsigned long resolve_hidden_symbol(const char *name) {
     return addr;
 }
 
-/* ===== 硬件断点内核回调 (这里绝对不能有任何会休眠的代码) ===== */
+/* ===== 硬件断点内核回调 (硬中断上下文，绝对禁止休眠) ===== */
 static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
     uint64_t pc = regs->pc;
 
@@ -77,13 +79,12 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
         uint32_t flag = 0;
         uint64_t target_addr = regs->regs[1] + 0x1c;
         
-        // 使用探针挖出来的安全读取函数，绝对不会引发 Kernel Panic 死机！
+        // 使用探针挖出的安全读取 API，不会引发缺页中断死机
         if (fn_nofault_read) {
             if (fn_nofault_read(&flag, (void __user *)target_addr, 4) == 0) {
                 if (flag == 1) return; // 放行原指令
             }
         }
-        
         regs->regs[0] = 1;
         regs->pc = regs->regs[30];
         return;
@@ -121,13 +122,11 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
 
     if (!req) return -EINVAL;
 
-    // 初始化时一并挖出 copy_from_user_nofault
-    if (!fn_register || !fn_unregister || !fn_nofault_read) {
+    if (!fn_register || !fn_unregister) {
         fn_register = (reg_user_hwbkpt_t)resolve_hidden_symbol("register_user_hw_breakpoint");
         fn_unregister = (unreg_hwbkpt_t)resolve_hidden_symbol("unregister_hw_breakpoint");
         fn_nofault_read = (cfun_t)resolve_hidden_symbol("copy_from_user_nofault");
         
-        // 兼容更旧或更新的内核命名
         if (!fn_nofault_read) fn_nofault_read = (cfun_t)resolve_hidden_symbol("probe_kernel_read");
 
         if (!fn_register || !fn_unregister) {
@@ -150,7 +149,8 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
         return -ESRCH;
     }
 
-    spin_lock(&g_bp_lock);
+    // 【核心修复】获取安全的 Mutex 锁，允许内部睡眠分配内存
+    mutex_lock(&g_bp_mutex);
     if (req->border_on && g_bp_count < MAX_BPS) {
         bp = install_bp(tsk, g_game_base + OFF_BORDER);
         if (bp) g_bps[g_bp_count++] = bp;
@@ -167,7 +167,7 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
         bp = install_bp(tsk, g_game_base + OFF_MAXHP);
         if (bp) g_bps[g_bp_count++] = bp;
     }
-    spin_unlock(&g_bp_lock);
+    mutex_unlock(&g_bp_mutex);
 
     put_pid(pid_struct);
     return 0; 
@@ -175,7 +175,7 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
 
 void wuwa_cleanup_perf_hbp(void) {
     int i;
-    spin_lock(&g_bp_lock);
+    mutex_lock(&g_bp_mutex);
     for (i = 0; i < g_bp_count; i++) {
         if (g_bps[i] && fn_unregister) {
             fn_unregister(g_bps[i]);
@@ -183,5 +183,5 @@ void wuwa_cleanup_perf_hbp(void) {
         }
     }
     g_bp_count = 0;
-    spin_unlock(&g_bp_lock);
+    mutex_unlock(&g_bp_mutex);
 }
