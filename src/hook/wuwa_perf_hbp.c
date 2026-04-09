@@ -39,7 +39,7 @@ static void wuwa_hbp_handler(struct perf_event *bp,
         uint32_t flag = 0;
         
         // 内核态无缺页安全读取，防止引发 Kernel Panic
-        if (copy_from_user_nofault(&flag, (void __user *)target_addr, 4) == 0) {
+        if (copy_from_user(&flag, (void __user *)target_addr, 4) == 0) {
             if (flag == 1) return; 
         }
         regs->regs[0] = 1;
