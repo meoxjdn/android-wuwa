@@ -5,6 +5,7 @@
 #include <linux/slab.h>
 #include <linux/sched.h>
 #include <linux/pid.h>
+#include <linux/kprobes.h> // 引入探针寻址库
 
 /* ===== 游戏核心偏移 ===== */
 #define OFF_BORDER   0x8951160
@@ -36,6 +37,29 @@ static struct perf_event *g_bps[MAX_BPS];
 static int g_bp_count = 0;
 static DEFINE_SPINLOCK(g_bp_lock);
 
+/* =======================================================
+ * 🌟 核心科技：Kprobe 动态寻址绕过 Android 15 白名单 🌟
+ * ======================================================= */
+typedef struct perf_event *(*reg_user_hwbkpt_t)(struct perf_event_attr *attr,
+                                                perf_overflow_handler_t triggered,
+                                                void *context,
+                                                struct task_struct *tsk);
+typedef void (*unreg_hwbkpt_t)(struct perf_event *bp);
+
+static reg_user_hwbkpt_t fn_register = NULL;
+static unreg_hwbkpt_t fn_unregister = NULL;
+
+/* 强行从内核内存中捞出被隐藏的函数地址 */
+static unsigned long resolve_hidden_symbol(const char *name) {
+    struct kprobe kp = { .symbol_name = name };
+    unsigned long addr = 0;
+    if (register_kprobe(&kp) == 0) {
+        addr = (unsigned long)kp.addr;
+        unregister_kprobe(&kp);
+    }
+    return addr;
+}
+
 /* ===== 硬件断点内核回调 ===== */
 static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
     uint64_t pc = regs->pc;
@@ -53,12 +77,8 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
     if (g_damage_on && pc == g_game_base + OFF_DAMAGE) {
         uint32_t flag = 0;
         uint64_t target_addr = regs->regs[1] + 0x1c;
-        
-        // 退回已经被验证能成功过检的 copy_from_user
         if (copy_from_user(&flag, (void __user *)target_addr, 4) == 0) {
-            if (flag == 1) {
-                return; 
-            }
+            if (flag == 1) return; 
         }
         regs->regs[0] = 1;
         regs->pc = regs->regs[30];
@@ -72,6 +92,7 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
     }
 }
 
+/* ===== 动态调用安装断点 ===== */
 static struct perf_event *install_bp(struct task_struct *tsk, uint64_t addr) {
     struct perf_event_attr attr;
     struct perf_event *bp;
@@ -82,7 +103,10 @@ static struct perf_event *install_bp(struct task_struct *tsk, uint64_t addr) {
     attr.bp_type = HW_BREAKPOINT_X; 
     attr.disabled = 0;
 
-    bp = register_user_hw_breakpoint(&attr, wuwa_hbp_handler, NULL, tsk);
+    if (!fn_register) return NULL;
+    
+    // 使用捞出来的内存地址强行调用
+    bp = fn_register(&attr, wuwa_hbp_handler, NULL, tsk);
     if (IS_ERR(bp)) return NULL;
     
     return bp;
@@ -93,6 +117,16 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *user_req) {
     struct task_struct *tsk;
     struct perf_event *bp;
     struct pid *pid_struct;
+
+    // 第一次调用时，初始化探针寻址
+    if (!fn_register || !fn_unregister) {
+        fn_register = (reg_user_hwbkpt_t)resolve_hidden_symbol("register_user_hw_breakpoint");
+        fn_unregister = (unreg_hwbkpt_t)resolve_hidden_symbol("unregister_hw_breakpoint");
+        if (!fn_register || !fn_unregister) {
+            printk(KERN_ERR "[wuwa] 致命错误：无法在内存中找到硬件断点函数！\n");
+            return -ENOSYS;
+        }
+    }
 
     if (copy_from_user(&req, (void __user *)user_req, sizeof(req))) {
         return -EFAULT;
@@ -140,8 +174,9 @@ void wuwa_cleanup_perf_hbp(void) {
     int i;
     spin_lock(&g_bp_lock);
     for (i = 0; i < g_bp_count; i++) {
-        if (g_bps[i]) {
-            unregister_hw_breakpoint(g_bps[i]);
+        if (g_bps[i] && fn_unregister) {
+            // 使用捞出来的内存地址强行卸载
+            fn_unregister(g_bps[i]);
             g_bps[i] = NULL;
         }
     }
