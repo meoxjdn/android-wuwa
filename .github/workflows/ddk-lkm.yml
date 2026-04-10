@@ -1,38 +1,16 @@
-name: DDK Build Kernel Module
-
-on:
-  workflow_call:
-    inputs:
-      kmi:
-        description: 'KMI version'
-        required: true
-        type: string
-      ddk_release:
-        description: 'DDK release version'
-        required: false
-        default: '20250825'
-        type: string
-      module_name:
-        description: 'Kernel module name (without .ko extension)'
-        required: false
-        default: 'android-wuwa'
-        type: string
-
-jobs:
-  build-module:
-    name: Build ${{ inputs.module_name }}.ko for ${{ inputs.kmi }}
-    runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/ylarod/ddk:${{ inputs.kmi }}-${{ inputs.ddk_release }}
-      options: --privileged
-
-    steps:
-    - name: Checkout source code
-      uses: actions/checkout@v4
-
     - name: Build ${{ inputs.module_name }}.ko
       run: |
         echo "=== Building ${{ inputs.module_name }}.ko for KMI: ${{ inputs.kmi }} ==="
+
+        # 【终极防弹衣】：在编译前执行物理文本替换！
+        # 如果当前容器是 6.12，直接把源码里的 huge 强行改成 leaf！
+        if [[ "${{ inputs.kmi }}" == *"6.12"* ]]; then
+            echo ">>> 检测到 6.12 内核，正在执行源码强行篡改手术..."
+            # 查找并替换 .c 和 .h 文件中的关键字
+            find . -type f \( -name "*.c" -o -name "*.h" \) -exec sed -i 's/pmd_huge/pmd_leaf/g' {} +
+            find . -type f \( -name "*.c" -o -name "*.h" \) -exec sed -i 's/pud_huge/pud_leaf/g' {} +
+            echo ">>> 篡改完成，准备编译！"
+        fi
 
         make KDIR=$KERNEL_SRC
         
@@ -50,9 +28,3 @@ jobs:
         echo "Size: $(du -h "/github/workspace/out/$OUTPUT_NAME" | cut -f1)"
         llvm-strip -d "/github/workspace/out/$OUTPUT_NAME"
         echo "Size after stripping: $(du -h "/github/workspace/out/$OUTPUT_NAME" | cut -f1)"
-
-    - name: Upload ${{ inputs.module_name }}.ko artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: ${{ inputs.module_name }}-${{ inputs.kmi }}.ko
-        path: /github/workspace/out/${{ inputs.module_name }}-${{ inputs.kmi }}.ko
