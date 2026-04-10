@@ -34,30 +34,33 @@ jobs:
       run: |
         echo "=== Building ${{ inputs.module_name }}.ko for KMI: ${{ inputs.kmi }} ==="
 
-        # 【终极防弹衣】：在编译前执行物理文本替换！
+        # 1. 解决 6.12 专属的 Unknown symbol (pmd_huge 变 pmd_leaf) 问题
         if [[ "${{ inputs.kmi }}" == *"6.12"* ]]; then
-            echo ">>> 检测到 6.12 内核，正在执行源码强行篡改手术..."
+            echo ">>> 检测到 6.12 内核，正在执行符号兼容性篡改..."
             find . -type f \( -name "*.c" -o -name "*.h" \) -exec sed -i 's/pmd_huge/pmd_leaf/g' {} +
             find . -type f \( -name "*.c" -o -name "*.h" \) -exec sed -i 's/pud_huge/pud_leaf/g' {} +
-            echo ">>> 篡改完成，准备编译！"
+            echo ">>> 符号篡改完成！"
         fi
 
-        make KDIR=$KERNEL_SRC
+        # 2. 【核心破局点】强行剥离 DDK 的 CFI 指纹和 LTO 优化
+        # 解决第三方内核刷入官方 DDK 驱动时瞬间 Kernel Panic 死机的问题
+        echo ">>> 正在关闭 CFI 和 LTO 进行通用兼容编译..."
+        make KDIR=$KERNEL_SRC CONFIG_CFI_CLANG=n CONFIG_LTO_CLANG=n CONFIG_LTO_CLANG_THIN=n
         
         echo "=== Build completed ==="
 
-        # Create output directory in GitHub workspace
+        # 3. 创建输出目录
         mkdir -p /github/workspace/out
         
-        # Copy with KMI-specific naming
+        # 4. 拷贝文件并重命名
         OUTPUT_NAME="${{ inputs.module_name }}-${{ inputs.kmi }}.ko"
         cp "${{ inputs.module_name }}.ko" "/github/workspace/out/$OUTPUT_NAME"
 
         echo "Copied to: /github/workspace/out/$OUTPUT_NAME"
         ls -la "/github/workspace/out/$OUTPUT_NAME"
-        echo "Size: $(du -h "/github/workspace/out/$OUTPUT_NAME" | cut -f1)"
+        echo "Size before stripping: $(du -h "/github/workspace/out/$OUTPUT_NAME" | cut -f1)"
         
-        # Strip symbols to reduce file size
+        # 5. 剥离调试符号减小体积
         llvm-strip -d "/github/workspace/out/$OUTPUT_NAME"
         echo "Size after stripping: $(du -h "/github/workspace/out/$OUTPUT_NAME" | cut -f1)"
 
