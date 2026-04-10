@@ -7,9 +7,23 @@
 #include <linux/sched/signal.h>
 #include <linux/seq_file.h>
 #include <linux/uaccess.h>
+#include <linux/version.h>  // 引入 version.h 以确保宏定义正常工作
 #include "wuwa_common.h"
-
 #include "wuwa_utils.h"
+
+/* ========================================================
+ * [内核 6.12 兼容性补丁]
+ * 解决 6.12+ 报 Unknown symbol pud_huge / pmd_huge 的问题。
+ * 在高版本中官方删除了 huge 后缀，改用 leaf 后缀。
+ * ======================================================== */
+#ifndef pmd_huge
+#define pmd_huge(pmd) pmd_leaf(pmd)
+#endif
+
+#ifndef pud_huge
+#define pud_huge(pud) pud_leaf(pud)
+#endif
+/* ======================================================== */
 
 // Function to merge and print contiguous memory regions
 static void print_merged_region(unsigned long* start, unsigned long* end) {
@@ -34,7 +48,7 @@ static void walk_pte_level(pmd_t* pmd, unsigned long addr, unsigned long end, un
         pte_end = end;
 
     ptep = pte_offset_kernel(pmd, addr);
-    ptep = NULL;
+    ptep = NULL; // ⚠️ 注意这里：这行代码会强制 ptep 为空
     if (!ptep) {
         return;
     }
