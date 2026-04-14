@@ -11,7 +11,7 @@
 #include <asm/fpsimd.h>
 
 /* ================================================================
- * 日志伪装与静默控制 (DEBUG_MODE = 0 时实现 0 dmesg 污染)
+ * 日志伪装与静默控制
  * ================================================================ */
 #define DEBUG_MODE 0
 
@@ -58,6 +58,10 @@ typedef void (*fpsimd_load_fn_t)(const struct user_fpsimd_state *);
 
 static reg_fn_t           fn_register      = NULL;
 static unreg_fn_t         fn_unregister    = NULL;
+/* 恢复基础底层函数指针 */
+static read_nofault_fn_t  fn_nofault_read  = NULL;
+static fpsimd_save_fn_t   fn_fpsimd_save   = NULL;
+static fpsimd_load_fn_t   fn_fpsimd_load   = NULL;
 
 #pragma pack(push, 8)
 struct wuwa_hbp_req {
@@ -68,8 +72,12 @@ struct wuwa_hbp_req {
     int      skip_on;
     int      damage_on;
     int      maxhp_on;
-    uint64_t reg_addr;     /* 由用户态传入的 register_user_hw_breakpoint 地址 */
-    uint64_t unreg_addr;   /* 由用户态传入的 unregister_hw_breakpoint 地址 */
+    uint64_t reg_addr;
+    uint64_t unreg_addr;
+    /* 接收用户态解析的底层函数地址 */
+    uint64_t nofault_read_addr;
+    uint64_t fpsimd_save_addr;
+    uint64_t fpsimd_load_addr;
 };
 #pragma pack(pop)
 
@@ -80,7 +88,7 @@ struct core_cmd_packet {
 #define CMD_HBP_INSTALL 0x5A5A1001
 
 /* ================================================================
- * 核心断点回调
+ * 核心断点回调 (已全量还原业务逻辑)
  * ================================================================ */
 static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
     uint64_t pc;
@@ -111,16 +119,34 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
         return;
     }
 
-    /* 4. 智能无敌 */
+    /* 4. 智能无敌 (还原完整内存安全读取与敌我判定逻辑) */
     if (g_damage_on && pc == base + OFF_DAMAGE) {
+        uint32_t flag = 0;
+        uint64_t target_addr = regs->regs[1] + 0x1C;
+        if (fn_nofault_read) {
+            if (fn_nofault_read(&flag, (void __user *)target_addr, 4) == 0) {
+                if (flag == 1) { // 敌人受击
+                    regs->regs[19] = regs->regs[1]; 
+                    regs->pc += 4; 
+                    return;
+                }
+            }
+        }
+        /* 玩家受击，执行免疫与堆栈修复 */
         regs->sp += 0x30;
         regs->regs[0] = 1;
         regs->pc = regs->regs[30];
         return;
     }
 
-    /* 5. 全屏 FOV */
+    /* 5. 全屏 FOV (还原浮点寄存器暴力修改逻辑) */
     if (g_fov_on && pc == base + OFF_FOV) {
+        if (fn_fpsimd_save && fn_fpsimd_load) {
+            struct user_fpsimd_state *fp = &current->thread.uw.fpsimd_state;
+            fn_fpsimd_save(fp);
+            fp->vregs[0] = (fp->vregs[0] & ~((__uint128_t)0xFFFFFFFFULL)) | (__uint128_t)FOV_TARGET_BITS;
+            fn_fpsimd_load(fp);
+        }
         regs->pc = regs->regs[30];
         return;
     }
@@ -149,13 +175,13 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
 
     if (!req) return -EINVAL;
 
-    /* 接收用户态解析的符号地址，根除 Kprobe */
-    if (!fn_register && req->reg_addr) {
-        fn_register = (reg_fn_t)req->reg_addr;
-    }
-    if (!fn_unregister && req->unreg_addr) {
-        fn_unregister = (unreg_fn_t)req->unreg_addr;
-    }
+    /* 接收并初始化所有函数指针 */
+    if (!fn_register && req->reg_addr) fn_register = (reg_fn_t)req->reg_addr;
+    if (!fn_unregister && req->unreg_addr) fn_unregister = (unreg_fn_t)req->unreg_addr;
+    if (!fn_nofault_read && req->nofault_read_addr) fn_nofault_read = (read_nofault_fn_t)req->nofault_read_addr;
+    if (!fn_fpsimd_save && req->fpsimd_save_addr) fn_fpsimd_save = (fpsimd_save_fn_t)req->fpsimd_save_addr;
+    if (!fn_fpsimd_load && req->fpsimd_load_addr) fn_fpsimd_load = (fpsimd_load_fn_t)req->fpsimd_load_addr;
+    
     if (!fn_register) return -ENOSYS;
 
     pid_struct = find_get_pid(req->tid);
@@ -204,7 +230,7 @@ void wuwa_cleanup_perf_hbp(void) {
 }
 
 /* ================================================================
- * 字符设备通信层 (替换 IOCTL 与 RAW Socket)
+ * 字符设备通信层
  * ================================================================ */
 static ssize_t core_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos) {
     struct core_cmd_packet pkt;
@@ -233,14 +259,12 @@ static struct miscdevice core_misc = {
     .fops  = &core_fops,
 };
 
-/* 重命名为独立接口，避免与主模块的 init_module 冲突 */
 int wuwa_hbp_init_device(void) {
     int ret = misc_register(&core_misc);
     if (ret) CORE_ERR("Failed to register misc device\n");
     return ret;
 }
 
-/* 重命名为独立接口，避免与主模块的 cleanup_module 冲突 */
 void wuwa_hbp_cleanup_device(void) {
     wuwa_cleanup_perf_hbp();
     misc_deregister(&core_misc);
