@@ -10,9 +10,6 @@
 #include <asm/processor.h>
 #include <asm/fpsimd.h>
 
-/* ================================================================
- * 日志伪装与静默控制
- * ================================================================ */
 #define DEBUG_MODE 0
 
 #if DEBUG_MODE
@@ -23,9 +20,6 @@
 #define CORE_ERR(fmt, ...) do {} while(0)
 #endif
 
-/* ================================================================
- * 核心偏移
- * ================================================================ */
 #define OFF_BORDER      0x8951160ULL
 #define OFF_PAUSE_WIN   0x2639fd8ULL
 #define OFF_PAUSE_JMP   0x53709a0ULL
@@ -36,9 +30,6 @@
 #define MAX_BPS         160
 #define FOV_TARGET_BITS 0x4089999AU
 
-/* ================================================================
- * 全局状态与类型定义
- * ================================================================ */
 static uint64_t          g_game_base  = 0;
 static struct perf_event *g_bps[MAX_BPS];
 static int               g_bp_count   = 0;
@@ -62,7 +53,6 @@ static read_nofault_fn_t  fn_nofault_read  = NULL;
 static fpsimd_save_fn_t   fn_fpsimd_save   = NULL;
 static fpsimd_load_fn_t   fn_fpsimd_load   = NULL;
 
-/* 引入原项目自带的安全解析接口 */
 extern unsigned long kallsyms_lookup_name_ex(const char *name);
 
 #pragma pack(push, 8)
@@ -81,9 +71,10 @@ struct core_cmd_packet {
     uint32_t cmd_id;
     uint64_t payload_ptr;
 };
-#define CMD_HBP_INSTALL 0x5A5A1001
 
-/* 在内核原生解析符号，彻底规避用户态 kptr_restrict 封锁且不走 Kprobe */
+#define CMD_HBP_INSTALL 0x5A5A1001
+#define CMD_HBP_CLEANUP 0x5A5A1002 /* 新增清空旧断点指令 */
+
 static int resolve_symbols_natively(void) {
     if (fn_register) return 0;
 
@@ -103,9 +94,6 @@ static int resolve_symbols_natively(void) {
     return 0;
 }
 
-/* ================================================================
- * 核心断点回调
- * ================================================================ */
 static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
     uint64_t pc;
     uint64_t base;
@@ -115,27 +103,23 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
     pc   = regs->pc;
     base = g_game_base;
 
-    /* 1. 去黑边 */
     if (g_border_on && pc == base + OFF_BORDER) {
         regs->regs[0] = 1;
         regs->pc = regs->regs[30];
         return;
     }
 
-    /* 2. 副本秒过 */
     if (g_skip_on && pc == base + OFF_PAUSE_WIN) {
         regs->pc = base + OFF_PAUSE_JMP;
         return;
     }
 
-    /* 3. 1血秒杀 */
     if (g_maxhp_on && pc == base + OFF_KILL) {
         regs->regs[0] = 1;
         regs->pc = regs->regs[30];
         return;
     }
 
-    /* 4. 智能无敌 */
     if (g_damage_on && pc == base + OFF_DAMAGE) {
         uint32_t flag = 0;
         uint64_t target_addr = regs->regs[1] + 0x1C;
@@ -154,7 +138,6 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
         return;
     }
 
-    /* 5. 全屏 FOV */
     if (g_fov_on && pc == base + OFF_FOV) {
         if (fn_fpsimd_save && fn_fpsimd_load) {
             struct user_fpsimd_state *fp = &current->thread.uw.fpsimd_state;
@@ -167,9 +150,6 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
     }
 }
 
-/* ================================================================
- * 安装与清理
- * ================================================================ */
 static struct perf_event *install_bp(struct task_struct *tsk, uint64_t addr) {
     struct perf_event_attr attr;
     struct perf_event     *bp;
@@ -189,8 +169,6 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     struct pid         *pid_struct;
 
     if (!req) return -EINVAL;
-    
-    /* 触发底层原生寻址 */
     if (resolve_symbols_natively() != 0) return -ENOSYS;
 
     pid_struct = find_get_pid(req->tid);
@@ -221,7 +199,6 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
 unlock_out:
     mutex_unlock(&g_bp_mutex);
     put_pid(pid_struct);
-    CORE_INFO("Injected TID: %d\n", req->tid);
     return 0;
 }
 
@@ -238,9 +215,6 @@ void wuwa_cleanup_perf_hbp(void) {
     mutex_unlock(&g_bp_mutex);
 }
 
-/* ================================================================
- * 字符设备通信层
- * ================================================================ */
 static ssize_t core_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos) {
     struct core_cmd_packet pkt;
     struct wuwa_hbp_req req;
@@ -253,10 +227,14 @@ static ssize_t core_write(struct file *file, const char __user *buf, size_t coun
         if (copy_from_user(&req, (void __user *)pkt.payload_ptr, sizeof(req))) {
             return -EFAULT;
         }
-        /* 严谨向上传递内核挂载状态 */
         ret = wuwa_install_perf_hbp(&req);
         if (ret < 0) return ret;
+    } 
+    /* 接收并处理清理指令，释放所有底层占用 */
+    else if (pkt.cmd_id == CMD_HBP_CLEANUP) {
+        wuwa_cleanup_perf_hbp();
     }
+    
     return count;
 }
 
@@ -273,7 +251,6 @@ static struct miscdevice core_misc = {
 
 int wuwa_hbp_init_device(void) {
     int ret = misc_register(&core_misc);
-    if (ret) CORE_ERR("Failed to register misc device\n");
     return ret;
 }
 
