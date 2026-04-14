@@ -80,15 +80,13 @@ static int __init wuwa_init(void) {
 
     return 0;
 
-/* 将通用的清理标签移出宏定义，防止编译时找不到标签 */
+/* * 严格贴合宏定义的异常回滚链，彻底消灭 Unused Label 错误
+ * 删除了历史遗留且无用的 clean_d0 和 clean_sig
+ */
 #if defined(BUILD_HIDE_SIGNAL)
-clean_d0:
-    wuwa_safe_signal_cleanup();
-clean_sig:
-#endif
-
 clean_hbp:
     wuwa_hbp_cleanup_device();
+#endif
 
 clean_proto:
     wuwa_proto_cleanup();
