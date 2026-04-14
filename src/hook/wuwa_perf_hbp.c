@@ -113,7 +113,6 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
 
     /* 4. 智能无敌 */
     if (g_damage_on && pc == base + OFF_DAMAGE) {
-        /* 此处为了保持原有基础功能不删减，保留逻辑，建议后续通过寄存器判断替换 */
         regs->sp += 0x30;
         regs->regs[0] = 1;
         regs->pc = regs->regs[30];
@@ -191,6 +190,19 @@ unlock_out:
     return 0;
 }
 
+void wuwa_cleanup_perf_hbp(void) {
+    int i;
+    mutex_lock(&g_bp_mutex);
+    for (i = 0; i < g_bp_count; i++) {
+        if (g_bps[i] && fn_unregister) {
+            fn_unregister(g_bps[i]);
+            g_bps[i] = NULL;
+        }
+    }
+    g_bp_count = 0;
+    mutex_unlock(&g_bp_mutex);
+}
+
 /* ================================================================
  * 字符设备通信层 (替换 IOCTL 与 RAW Socket)
  * ================================================================ */
@@ -221,23 +233,15 @@ static struct miscdevice core_misc = {
     .fops  = &core_fops,
 };
 
-int init_module(void) {
+/* 重命名为独立接口，避免与主模块的 init_module 冲突 */
+int wuwa_hbp_init_device(void) {
     int ret = misc_register(&core_misc);
     if (ret) CORE_ERR("Failed to register misc device\n");
     return ret;
 }
 
-void cleanup_module(void) {
-    int i;
-    mutex_lock(&g_bp_mutex);
-    for (i = 0; i < g_bp_count; i++) {
-        if (g_bps[i] && fn_unregister) {
-            fn_unregister(g_bps[i]);
-            g_bps[i] = NULL;
-        }
-    }
-    g_bp_count = 0;
-    mutex_unlock(&g_bp_mutex);
+/* 重命名为独立接口，避免与主模块的 cleanup_module 冲突 */
+void wuwa_hbp_cleanup_device(void) {
+    wuwa_cleanup_perf_hbp();
     misc_deregister(&core_misc);
 }
-MODULE_LICENSE("GPL");
