@@ -17,12 +17,13 @@
 #include "wuwa_utils.h"
 #include "hijack_arm64.h"
 
-// [新增] 引入功能头文件
+// 引入功能头文件
 #include "wuwa_hide_trace.h" 
-#include "../hook/wuwa_perf_hbp.h" // 确保能引用到内核断点的清理接口
+#include "../hook/wuwa_perf_hbp.h" 
 
-// 声明外部清理函数
-extern void wuwa_cleanup_perf_hbp(void);
+// 声明外部初始化与清理函数 (与重构后的 wuwa_perf_hbp.c 对应)
+extern int wuwa_hbp_init_device(void);
+extern void wuwa_hbp_cleanup_device(void);
 
 static int __init wuwa_init(void) {
     int ret;
@@ -42,17 +43,25 @@ static int __init wuwa_init(void) {
         return ret;
     }
 
+    /* 保留原有的协议初始化，维持其他 ioctl 基础功能 (如内存读写) 不受影响 */
     ret = wuwa_proto_init();
     if (ret) {
         wuwa_err("wuwa_socket_init failed: %d\n", ret);
         goto out;
     }
 
+    /* [新增] 注册重构后的隐蔽字符设备，用于接收硬件断点指令 */
+    ret = wuwa_hbp_init_device();
+    if (ret) {
+        wuwa_err("wuwa_hbp_init_device failed: %d\n", ret);
+        goto clean_proto;
+    }
+
 #if defined(BUILD_HIDE_SIGNAL)
     ret = wuwa_safe_signal_init();
     if (ret) {
         wuwa_err("wuwa_safe_signal_init failed: %d\n", ret);
-        goto clean_sig;
+        goto clean_hbp;
     }
 #endif
 
@@ -64,7 +73,7 @@ static int __init wuwa_init(void) {
     wuwa_info("NO_CFI is enabled, patched: %d\n", cfi_bypass());
 #endif
 
-    // [新增] 启动 TracerPid 隐藏逻辑 (基于 Kretprobe)
+    // 启动 TracerPid 隐藏逻辑 (基于 Kretprobe)
     if (wuwa_hide_trace_init() != 0) {
         wuwa_warn("wuwa_hide_trace_init failed, device might lack Ftrace support.\n");
     }
@@ -75,8 +84,14 @@ static int __init wuwa_init(void) {
 clean_d0:
     wuwa_safe_signal_cleanup();
 
-clean_sig:
+clean_hbp:
+    wuwa_hbp_cleanup_device();
+
+clean_proto:
     wuwa_proto_cleanup();
+
+clean_sig:
+    /* 兼容原有的跳转标签 */
 #endif
 
 out:
@@ -86,13 +101,13 @@ out:
 static void __exit wuwa_exit(void) {
     wuwa_info("bye!\n");
 
-    // [新增] 关键步骤：优先清理所有内核硬件断点，释放 CPU 寄存器槽位
-    // 防止 rmmod 后断点残留导致内核崩溃或 CPU 异常
-    wuwa_cleanup_perf_hbp();
+    // [修改] 调用新的联合清理接口：注销断点并卸载隐藏设备节点
+    wuwa_hbp_cleanup_device();
     
-    // [新增] 卸载 TracerPid 隐藏 Hook
+    // 卸载 TracerPid 隐藏 Hook
     wuwa_hide_trace_exit();
     
+    // 清理原有的 Socket 协议
     wuwa_proto_cleanup();
 
 #if defined(BUILD_HIDE_SIGNAL)
