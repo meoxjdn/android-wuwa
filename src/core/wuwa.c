@@ -21,7 +21,7 @@
 #include "wuwa_hide_trace.h" 
 #include "../hook/wuwa_perf_hbp.h" 
 
-// 声明外部初始化与清理函数 (与重构后的 wuwa_perf_hbp.c 对应)
+// 声明外部初始化与清理函数
 extern int wuwa_hbp_init_device(void);
 extern void wuwa_hbp_cleanup_device(void);
 
@@ -43,14 +43,14 @@ static int __init wuwa_init(void) {
         return ret;
     }
 
-    /* 保留原有的协议初始化，维持其他 ioctl 基础功能 (如内存读写) 不受影响 */
+    /* 保留原有的协议初始化，维持其他 ioctl 基础功能不受影响 */
     ret = wuwa_proto_init();
     if (ret) {
         wuwa_err("wuwa_socket_init failed: %d\n", ret);
         goto out;
     }
 
-    /* [新增] 注册重构后的隐蔽字符设备，用于接收硬件断点指令 */
+    /* 注册重构后的隐蔽字符设备，用于接收硬件断点指令 */
     ret = wuwa_hbp_init_device();
     if (ret) {
         wuwa_err("wuwa_hbp_init_device failed: %d\n", ret);
@@ -80,19 +80,18 @@ static int __init wuwa_init(void) {
 
     return 0;
 
+/* 将通用的清理标签移出宏定义，防止编译时找不到标签 */
 #if defined(BUILD_HIDE_SIGNAL)
 clean_d0:
     wuwa_safe_signal_cleanup();
+clean_sig:
+#endif
 
 clean_hbp:
     wuwa_hbp_cleanup_device();
 
 clean_proto:
     wuwa_proto_cleanup();
-
-clean_sig:
-    /* 兼容原有的跳转标签 */
-#endif
 
 out:
     return ret;
@@ -101,7 +100,7 @@ out:
 static void __exit wuwa_exit(void) {
     wuwa_info("bye!\n");
 
-    // [修改] 调用新的联合清理接口：注销断点并卸载隐藏设备节点
+    // 调用新的联合清理接口：注销断点并卸载隐藏设备节点
     wuwa_hbp_cleanup_device();
     
     // 卸载 TracerPid 隐藏 Hook
