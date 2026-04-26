@@ -17,9 +17,6 @@
 #define MAX_HOOKS 32
 #define FOV_TARGET_BITS 0x4089999AU
 
-/* ==========================================================
- * 通用通信协议 & 行为定义
- * ========================================================== */
 enum hook_action {
     ACTION_RET       = 0,
     ACTION_FOV       = 1,
@@ -44,9 +41,6 @@ struct ioctl_init_req {
 #define CMD_INIT_HOOKS _IOW(IOCTL_MAGIC, 1, struct ioctl_init_req)
 #define CMD_CLEANUP    _IO(IOCTL_MAGIC, 2)
 
-/* ==========================================================
- * 内部状态与 PTE 管理 (绑定 fd)
- * ========================================================== */
 struct hook_node {
     uint64_t vaddr;
     uint32_t action;
@@ -54,6 +48,7 @@ struct hook_node {
     pte_t *ptep;
     pte_t orig_pte;
     int active;
+    int is_stepping; /* 新增：单步状态标记 */
 };
 
 struct client_ctx {
@@ -79,15 +74,12 @@ static void resolve_symbols(void) {
     if (fn_nofault_read) return;
     fn_nofault_read = (read_nofault_fn_t)kallsyms_lookup_name_ex("copy_from_user_nofault");
     if (!fn_nofault_read) fn_nofault_read = (read_nofault_fn_t)kallsyms_lookup_name_ex("probe_kernel_read");
-    
     fn_fpsimd_save = (fpsimd_save_fn_t)kallsyms_lookup_name_ex("fpsimd_save_state");
     if (!fn_fpsimd_save) fn_fpsimd_save = (fpsimd_save_fn_t)kallsyms_lookup_name_ex("fpsimd_save_and_flush_cpu_state");
-    
     fn_fpsimd_load = (fpsimd_load_fn_t)kallsyms_lookup_name_ex("fpsimd_load_state");
     if (!fn_fpsimd_load) fn_fpsimd_load = (fpsimd_load_fn_t)kallsyms_lookup_name_ex("fpsimd_flush_cpu_state");
 }
 
-/* 核心页表漫游机制 */
 static pte_t *walk_and_get_pte(struct mm_struct *mm, unsigned long addr) {
     pgd_t *pgd; p4d_t *p4d; pud_t *pud; pmd_t *pmd; pte_t *pte;
     pgd = pgd_offset(mm, addr);
@@ -102,21 +94,13 @@ static pte_t *walk_and_get_pte(struct mm_struct *mm, unsigned long addr) {
     return pte;
 }
 
-/* ==========================================================
- * [高能预警] ARM64 底层汇编硬接管，无视 GKI 未导出符号
- * ========================================================== */
-
 static inline void stealth_set_pte_hard(pte_t *ptep, pte_t pte_val) {
-    /* 直接暴力覆写物理内存，绕过 __sync_icache_dcache 等所有同步宏 */
     WRITE_ONCE(*ptep, pte_val);
-    dsb(ishst); /* Data Synchronization Barrier: 确保页表写入完成 */
-    isb();      /* Instruction Synchronization Barrier: 清空流水线 */
+    dsb(ishst);
+    isb();
 }
 
 static inline void stealth_flush_tlb_page_hard(unsigned long vaddr) {
-    /* * 直接调用底层硬件指令刷新所有 ASID 对应的该虚拟地址 TLB
-     * 绕过 __mmu_notifier_arch_invalidate_secondary_tlbs 
-     */
     unsigned long page_addr = vaddr >> 12;
     dsb(ishst);
     asm volatile("tlbi vaae1is, %0" : : "r" (page_addr));
@@ -132,22 +116,17 @@ static int apply_pte_uxn(struct client_ctx *ctx, struct hook_request *req, int i
     if (!mm) return -EINVAL;
     mmap_read_lock(mm);
     ptep = walk_and_get_pte(mm, req->vaddr);
-    if (!ptep || !pte_present(*ptep)) {
-        mmap_read_unlock(mm);
-        return -EFAULT;
-    }
+    if (!ptep || !pte_present(*ptep)) { mmap_read_unlock(mm); return -EFAULT; }
 
     ctx->hooks[index].vaddr = req->vaddr;
     ctx->hooks[index].action = req->action;
     ctx->hooks[index].reg_val = req->reg_val;
     ctx->hooks[index].ptep = ptep;
     ctx->hooks[index].orig_pte = *ptep;
+    ctx->hooks[index].is_stepping = 0;
 
-    /* 获取带 UXN 标志的新 PTE 值 */
     pte_val = *ptep;
     pte_val = set_pte_bit(pte_val, __pgprot(PTE_UXN));
-    
-    /* [改写生效] 使用硬级写内存与 TLB 刷新 */
     stealth_set_pte_hard(ptep, pte_val);
     stealth_flush_tlb_page_hard(req->vaddr);
     
@@ -165,7 +144,6 @@ static void restore_all_ptes(struct client_ctx *ctx) {
     mmap_read_lock(mm);
     for (i = 0; i < ctx->hook_count; i++) {
         if (ctx->hooks[i].active && ctx->hooks[i].ptep) {
-            /* [改写生效] 恢复原生 PTE 并作废 TLB */
             stealth_set_pte_hard(ctx->hooks[i].ptep, ctx->hooks[i].orig_pte);
             stealth_flush_tlb_page_hard(ctx->hooks[i].vaddr);
             ctx->hooks[i].active = 0;
@@ -174,11 +152,10 @@ static void restore_all_ptes(struct client_ctx *ctx) {
     mmap_read_unlock(mm);
 }
 
-/* ==========================================================
- * Kprobe 异常捕获 (核心拦截逻辑)
- * ========================================================== */
 static struct kprobe kp_mem_abort;
+static struct kprobe kp_debug_exc;
 
+/* 核心一：拦截 UXN 异常并开启硬件单步 */
 static int pre_mem_abort_handler(struct kprobe *p, struct pt_regs *regs) {
     struct pt_regs *fault_regs = (struct pt_regs *)regs->regs[2];
     uint64_t pc;
@@ -188,46 +165,76 @@ static int pre_mem_abort_handler(struct kprobe *p, struct pt_regs *regs) {
     pc = fault_regs->pc;
 
     for (i = 0; i < g_active_ctx->hook_count; i++) {
-        if (g_active_ctx->hooks[i].active && pc == g_active_ctx->hooks[i].vaddr) {
-            uint32_t action = g_active_ctx->hooks[i].action;
-
-            if (action == ACTION_RET) {
-                fault_regs->pc = fault_regs->regs[30];
-            } 
-            else if (action == ACTION_JMP) {
-                fault_regs->pc = g_active_ctx->hooks[i].reg_val;
-            } 
-            else if (action == ACTION_FOV) {
-                if (fn_fpsimd_save && fn_fpsimd_load) {
-                    struct user_fpsimd_state *fp = &current->thread.uw.fpsimd_state;
-                    fn_fpsimd_save(fp);
-                    fp->vregs[0] = (fp->vregs[0] & ~((__uint128_t)0xFFFFFFFFULL)) | (__uint128_t)FOV_TARGET_BITS;
-                    fn_fpsimd_load(fp);
+        /* 只要是在同一个 4KB 内存页里触发了异常，都必须接管处理 */
+        if (g_active_ctx->hooks[i].active && (pc & ~0xFFFULL) == (g_active_ctx->hooks[i].vaddr & ~0xFFFULL)) {
+            
+            /* 如果正好是我们要 Hook 的那一行代码，就修改寄存器 */
+            if (pc == g_active_ctx->hooks[i].vaddr) {
+                uint32_t action = g_active_ctx->hooks[i].action;
+                if (action == ACTION_RET) { fault_regs->pc = fault_regs->regs[30]; } 
+                else if (action == ACTION_JMP) { fault_regs->pc = g_active_ctx->hooks[i].reg_val; } 
+                else if (action == ACTION_FOV) {
+                    if (fn_fpsimd_save && fn_fpsimd_load) {
+                        struct user_fpsimd_state *fp = &current->thread.uw.fpsimd_state;
+                        fn_fpsimd_save(fp);
+                        fp->vregs[0] = (fp->vregs[0] & ~((__uint128_t)0xFFFFFFFFULL)) | (__uint128_t)FOV_TARGET_BITS;
+                        fn_fpsimd_load(fp);
+                    }
+                    fault_regs->pc = fault_regs->regs[30];
                 }
-                fault_regs->pc = fault_regs->regs[30];
-            }
-            else if (action == ACTION_MAXHP) {
-                fault_regs->regs[0] = 1;
-                fault_regs->pc = fault_regs->regs[30];
-            }
-            else if (action == ACTION_DAMAGE) {
-                uint32_t flag = 0;
-                uint64_t target_addr = fault_regs->regs[1] + 0x1C;
-                if (fn_nofault_read && fn_nofault_read(&flag, (void __user *)target_addr, 4) == 0) {
-                    if (flag == 1) { 
+                else if (action == ACTION_MAXHP) { fault_regs->regs[0] = 1; fault_regs->pc = fault_regs->regs[30]; }
+                else if (action == ACTION_DAMAGE) {
+                    uint32_t flag = 0;
+                    uint64_t target_addr = fault_regs->regs[1] + 0x1C;
+                    if (fn_nofault_read && fn_nofault_read(&flag, (void __user *)target_addr, 4) == 0 && flag == 1) {
                         fault_regs->regs[19] = fault_regs->regs[1]; 
                         fault_regs->pc += 4; 
-                        instruction_pointer_set(regs, regs->pc + 4);
-                        return 1; 
+                    } else {
+                        fault_regs->sp += 0x30; fault_regs->regs[0] = 1; fault_regs->pc = fault_regs->regs[30];
                     }
                 }
-                fault_regs->sp += 0x30;
-                fault_regs->regs[0] = 1;
-                fault_regs->pc = fault_regs->regs[30];
             }
             
-            instruction_pointer_set(regs, regs->pc + 4); 
+            /* [关键修复] 无论是不是 Hook 代码，都必须解除 UXN 并让 CPU 走一步 */
+            stealth_set_pte_hard(g_active_ctx->hooks[i].ptep, g_active_ctx->hooks[i].orig_pte);
+            stealth_flush_tlb_page_hard(pc);
+            
+            /* 开启硬件单步标志位 SPSR_EL1.SS (Bit 21) */
+            fault_regs->pstate |= (1ULL << 21);
+            g_active_ctx->hooks[i].is_stepping = 1;
+            
+            /* 安全退出 do_mem_abort，返回到异常向量表 */
+            instruction_pointer_set(regs, regs->regs[30]); 
             return 1; 
+        }
+    }
+    return 0;
+}
+
+/* 核心二：捕获单步执行完毕，恢复 UXN */
+static int pre_debug_exception_handler(struct kprobe *p, struct pt_regs *regs) {
+    unsigned int esr = regs->regs[1];
+    struct pt_regs *fault_regs = (struct pt_regs *)regs->regs[2];
+    int i;
+
+    /* 检查是否是 EL0 触发的硬件单步异常 (ESR_ELx_EC_SOFTSTP_LOWER = 0x32) */
+    if (!fault_regs || !g_active_ctx || (esr >> 26) != 0x32) return 0;
+
+    for (i = 0; i < g_active_ctx->hook_count; i++) {
+        if (g_active_ctx->hooks[i].active && g_active_ctx->hooks[i].is_stepping) {
+            
+            /* 将 UXN 加回去，防止后面的指令漏网 */
+            pte_t uxn_pte = set_pte_bit(g_active_ctx->hooks[i].orig_pte, __pgprot(PTE_UXN));
+            stealth_set_pte_hard(g_active_ctx->hooks[i].ptep, uxn_pte);
+            stealth_flush_tlb_page_hard(g_active_ctx->hooks[i].vaddr);
+
+            /* 关闭单步标志位 */
+            fault_regs->pstate &= ~(1ULL << 21);
+            g_active_ctx->hooks[i].is_stepping = 0;
+
+            /* 安全退出 debug_handler */
+            instruction_pointer_set(regs, regs->regs[30]);
+            return 1;
         }
     }
     return 0;
@@ -313,22 +320,24 @@ static struct miscdevice misc_dev = {
     .fops  = &fops,
 };
 
-/* ==========================================================
- * 暴露给主模块 (wuwa.c) 调用的初始化接口，去除 module_init 避免符号冲突
- * ========================================================== */
-
 int wuwa_hbp_init_device(void) {
     kp_mem_abort.symbol_name = "do_mem_abort";
     kp_mem_abort.pre_handler = pre_mem_abort_handler;
     register_kprobe(&kp_mem_abort);
+
+    /* 注册调试异常探针，专门抓取单步 */
+    kp_debug_exc.symbol_name = "do_debug_exception";
+    kp_debug_exc.pre_handler = pre_debug_exception_handler;
+    register_kprobe(&kp_debug_exc);
+
     return misc_register(&misc_dev);
 }
 
 void wuwa_hbp_cleanup_device(void) {
     unregister_kprobe(&kp_mem_abort);
+    unregister_kprobe(&kp_debug_exc);
     misc_deregister(&misc_dev);
 }
 
-/* 兼容遗留调用，防止编译找不到符号 */
 int wuwa_install_perf_hbp(void *req) { return 0; }
 void wuwa_cleanup_perf_hbp(void) { }
