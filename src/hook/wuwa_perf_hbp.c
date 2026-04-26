@@ -83,7 +83,6 @@ static void resolve_symbols(void) {
     fn_fpsimd_load = (fpsimd_load_fn_t)kallsyms_lookup_name_ex("fpsimd_load_state");
     if (!fn_fpsimd_load) fn_fpsimd_load = (fpsimd_load_fn_t)kallsyms_lookup_name_ex("fpsimd_flush_cpu_state");
     
-    /* 动态挖出被 GKI 隐藏的内存分配 API */
     fn_module_alloc = (module_alloc_fn_t)kallsyms_lookup_name_ex("module_alloc");
     fn_module_memfree = (module_memfree_fn_t)kallsyms_lookup_name_ex("module_memfree");
 }
@@ -116,6 +115,43 @@ static inline void stealth_flush_tlb_page_hard(unsigned long vaddr) {
     isb();
 }
 
+/* ==========================================================
+ * [降维打击] 突破 GKI 限制，强制将分配的蹦床内存标记为可执行！
+ * ========================================================== */
+static int make_tramp_exec(void *addr) {
+    pgd_t *pgd; p4d_t *p4d; pud_t *pud; pmd_t *pmd; pte_t *ptep;
+    unsigned long va = (unsigned long)addr;
+    unsigned long val;
+    struct mm_struct *init_mm_ptr = (struct mm_struct *)kallsyms_lookup_name_ex("init_mm");
+
+    if (!init_mm_ptr) {
+        pr_err("[stealth_engine] init_mm not found, cannot assign exec permission!\n");
+        return -ENOSYS;
+    }
+
+    pgd = pgd_offset(init_mm_ptr, va);
+    if (pgd_none(*pgd) || pgd_bad(*pgd)) return -EFAULT;
+    p4d = p4d_offset(pgd, va);
+    if (p4d_none(*p4d) || p4d_bad(*p4d)) return -EFAULT;
+    pud = pud_offset(p4d, va);
+    if (pud_none(*pud) || pud_bad(*pud)) return -EFAULT;
+    pmd = pmd_offset(pud, va);
+    if (pmd_none(*pmd) || pmd_bad(*pmd)) return -EFAULT;
+    ptep = pte_offset_kernel(pmd, va);
+    if (!ptep || !pte_present(*ptep)) return -EFAULT;
+
+    /* 暴力抹除 PXN(位53) 和 UXN(位54) 标志位，强制允许指令执行 */
+    val = pte_val(*ptep);
+    val &= ~((1ULL << 53) | (1ULL << 54)); 
+    
+    stealth_set_pte_hard(ptep, __pte(val));
+    stealth_flush_tlb_page_hard(va);
+    return 0;
+}
+
+/* ==========================================================
+ * 业务 Hook 核心层 
+ * ========================================================== */
 static int apply_pte_uxn(struct client_ctx *ctx, struct hook_request *req, int index) {
     struct mm_struct *mm = ctx->task->mm;
     pte_t *ptep;
@@ -161,7 +197,7 @@ static void restore_all_ptes(struct client_ctx *ctx) {
 }
 
 /* ==========================================================
- * 微型 ARM64 Inline Hook 蹦床引擎 (纯动态寻址)
+ * 微型 ARM64 Inline Hook 蹦床引擎 
  * ========================================================== */
 extern int init_arch(void);
 extern int hook_write_range(void *target, void *source, int size);
@@ -170,8 +206,8 @@ extern void (*flush_icache_range_ptr)(unsigned long, unsigned long);
 static void build_absolute_jump(u8 *buf, uint64_t target_addr) {
     uint32_t *insn = (uint32_t *)buf;
     uint64_t *addr = (uint64_t *)(buf + 8);
-    insn[0] = 0x58000050; 
-    insn[1] = 0xd61f0200; 
+    insn[0] = 0x58000050; /* LDR X16, .+8 */
+    insn[1] = 0xd61f0200; /* BR X16 */
     *addr = target_addr;
 }
 
@@ -183,9 +219,15 @@ static int stealth_inline_hook(void *target, void *new_func, void **old_func) {
     if (init_arch() != 0) return -ENOSYS;
     if (!fn_module_alloc || !fn_module_memfree) return -ENOSYS;
     
-    /* 使用挖出来的真实地址动态分配内存 */
-    trampoline = fn_module_alloc(128);
+    /* 分配一整页，避免边界问题 */
+    trampoline = fn_module_alloc(PAGE_SIZE);
     if (!trampoline) return -ENOMEM;
+    
+    /* 【核心修复】强制剥除内存 PXN 保护，让跳板变得可执行！ */
+    if (make_tramp_exec(trampoline) != 0) {
+        fn_module_memfree(trampoline);
+        return -EFAULT;
+    }
     
     memcpy(trampoline, target, 16);
     build_absolute_jump(trampoline + 16, (uint64_t)target + 16);
@@ -315,7 +357,7 @@ static long dev_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
     int i, ret = 0;
 
     if (!ctx) return -EINVAL;
-    resolve_symbols(); /* 确保在此处初始化所有函数指针 */
+    resolve_symbols();
 
     switch (cmd) {
         case CMD_INIT_HOOKS:
@@ -367,7 +409,6 @@ static struct miscdevice misc_dev = {
 int wuwa_hbp_init_device(void) {
     unsigned long pf_addr, ss_addr;
 
-    /* 先执行符号解析，准备好蹦床需要的 module_alloc */
     resolve_symbols();
 
     pf_addr = kallsyms_lookup_name_ex("do_page_fault");
@@ -376,10 +417,12 @@ int wuwa_hbp_init_device(void) {
     if (!pf_addr || !ss_addr) return -ENOSYS;
 
     if (stealth_inline_hook((void *)pf_addr, (void *)stealth_do_page_fault, (void **)&orig_do_page_fault) < 0) {
+        pr_err("[stealth_engine] Failed to hook do_page_fault\n");
         return -EINVAL;
     }
     
     if (stealth_inline_hook((void *)ss_addr, (void *)stealth_single_step_handler, (void **)&orig_single_step_handler) < 0) {
+        pr_err("[stealth_engine] Failed to hook single_step_handler\n");
         return -EINVAL;
     }
 
@@ -391,6 +434,5 @@ void wuwa_hbp_cleanup_device(void) {
     misc_deregister(&misc_dev);
 }
 
-/* 兼容遗留调用 */
 int wuwa_install_perf_hbp(void *req) { return 0; }
 void wuwa_cleanup_perf_hbp(void) { }
