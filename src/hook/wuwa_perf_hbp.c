@@ -8,7 +8,6 @@
 #include <linux/pid.h>
 #include <linux/mutex.h>
 #include <linux/mm.h>
-#include <linux/kprobes.h>
 #include <asm/pgtable.h>
 #include <asm/barrier.h>
 #include <asm/fpsimd.h>
@@ -153,29 +152,36 @@ static void restore_all_ptes(struct client_ctx *ctx) {
 }
 
 /* ==========================================================
- * Kprobe 异常捕获
+ * 纯汇编劫持层 (Inline Hook Handlers)
+ * 彻底抛弃 Kprobe，使用裸函数指针接管异常向量！
  * ========================================================== */
-static struct kprobe kp_pf;
-static struct kprobe kp_ss;
 
-static int pre_pf_handler(struct kprobe *p, struct pt_regs *regs) {
-    unsigned int esr = regs->regs[1];
-    struct pt_regs *fault_regs = (struct pt_regs *)regs->regs[2];
+/* 定义原函数的函数指针类型 */
+typedef int (*fault_handler_t)(unsigned long far, unsigned int esr, struct pt_regs *regs);
+static fault_handler_t orig_do_page_fault = NULL;
+static fault_handler_t orig_single_step_handler = NULL;
+
+/* 劫持 do_page_fault 的处理函数 */
+int stealth_do_page_fault(unsigned long far, unsigned int esr, struct pt_regs *regs) {
     uint64_t pc;
     int i;
 
     /* 检查是否是 EL0 的指令异常 (0x20) */
-    if (!fault_regs || !g_active_ctx || (esr >> 26) != 0x20) return 0;
+    if (!regs || !g_active_ctx || (esr >> 26) != 0x20) {
+        return orig_do_page_fault(far, esr, regs); /* 不是我们的目标，放行给原内核处理 */
+    }
     
-    pc = fault_regs->pc;
+    pc = regs->pc;
 
     for (i = 0; i < g_active_ctx->hook_count; i++) {
+        /* 匹配 4KB UXN 页异常 */
         if (g_active_ctx->hooks[i].active && (pc & ~0xFFFULL) == (g_active_ctx->hooks[i].vaddr & ~0xFFFULL)) {
             
+            /* 命中 Hook 行 */
             if (pc == g_active_ctx->hooks[i].vaddr) {
                 uint32_t action = g_active_ctx->hooks[i].action;
-                if (action == ACTION_RET) { fault_regs->pc = fault_regs->regs[30]; } 
-                else if (action == ACTION_JMP) { fault_regs->pc = g_active_ctx->hooks[i].reg_val; } 
+                if (action == ACTION_RET) { regs->pc = regs->regs[30]; } 
+                else if (action == ACTION_JMP) { regs->pc = g_active_ctx->hooks[i].reg_val; } 
                 else if (action == ACTION_FOV) {
                     if (fn_fpsimd_save && fn_fpsimd_load) {
                         struct user_fpsimd_state *fp = &current->thread.uw.fpsimd_state;
@@ -183,17 +189,17 @@ static int pre_pf_handler(struct kprobe *p, struct pt_regs *regs) {
                         fp->vregs[0] = (fp->vregs[0] & ~((__uint128_t)0xFFFFFFFFULL)) | (__uint128_t)FOV_TARGET_BITS;
                         fn_fpsimd_load(fp);
                     }
-                    fault_regs->pc = fault_regs->regs[30];
+                    regs->pc = regs->regs[30];
                 }
-                else if (action == ACTION_MAXHP) { fault_regs->regs[0] = 1; fault_regs->pc = fault_regs->regs[30]; }
+                else if (action == ACTION_MAXHP) { regs->regs[0] = 1; regs->pc = regs->regs[30]; }
                 else if (action == ACTION_DAMAGE) {
                     uint32_t flag = 0;
-                    uint64_t target_addr = fault_regs->regs[1] + 0x1C;
+                    uint64_t target_addr = regs->regs[1] + 0x1C;
                     if (fn_nofault_read && fn_nofault_read(&flag, (void __user *)target_addr, 4) == 0 && flag == 1) {
-                        fault_regs->regs[19] = fault_regs->regs[1]; 
-                        fault_regs->pc += 4; 
+                        regs->regs[19] = regs->regs[1]; 
+                        regs->pc += 4; 
                     } else {
-                        fault_regs->sp += 0x30; fault_regs->regs[0] = 1; fault_regs->pc = fault_regs->regs[30];
+                        regs->sp += 0x30; regs->regs[0] = 1; regs->pc = regs->regs[30];
                     }
                 }
             }
@@ -203,24 +209,24 @@ static int pre_pf_handler(struct kprobe *p, struct pt_regs *regs) {
             stealth_flush_tlb_page_hard(pc);
             
             /* 开启硬件单步 (PSTATE.SS = bit 21) */
-            fault_regs->pstate |= (1ULL << 21);
+            regs->pstate |= (1ULL << 21);
             g_active_ctx->hooks[i].is_stepping = 1;
             
-            /* 直接返回到 LR，相当于截断 do_page_fault 不让它继续往里走 */
-            instruction_pointer_set(regs, regs->regs[30]); 
-            return 1; 
+            return 0; /* 成功处理，强行截断原生 do_page_fault 的执行！ */
         }
     }
-    return 0;
+    
+    return orig_do_page_fault(far, esr, regs);
 }
 
-static int pre_ss_handler(struct kprobe *p, struct pt_regs *regs) {
-    unsigned int esr = regs->regs[1];
-    struct pt_regs *fault_regs = (struct pt_regs *)regs->regs[2];
+/* 劫持 single_step_handler 的处理函数 */
+int stealth_single_step_handler(unsigned long addr, unsigned int esr, struct pt_regs *regs) {
     int i;
 
     /* 检查是否是单步异常 (0x32) */
-    if (!fault_regs || !g_active_ctx || (esr >> 26) != 0x32) return 0;
+    if (!regs || !g_active_ctx || (esr >> 26) != 0x32) {
+        return orig_single_step_handler(addr, esr, regs);
+    }
 
     for (i = 0; i < g_active_ctx->hook_count; i++) {
         if (g_active_ctx->hooks[i].active && g_active_ctx->hooks[i].is_stepping) {
@@ -230,14 +236,13 @@ static int pre_ss_handler(struct kprobe *p, struct pt_regs *regs) {
             stealth_flush_tlb_page_hard(g_active_ctx->hooks[i].vaddr);
 
             /* 关闭硬件单步 */
-            fault_regs->pstate &= ~(1ULL << 21);
+            regs->pstate &= ~(1ULL << 21);
             g_active_ctx->hooks[i].is_stepping = 0;
 
-            instruction_pointer_set(regs, regs->regs[30]);
-            return 1;
+            return 0; /* 成功处理，拦截到底！ */
         }
     }
-    return 0;
+    return orig_single_step_handler(addr, esr, regs);
 }
 
 /* ==========================================================
@@ -320,47 +325,47 @@ static struct miscdevice misc_dev = {
     .fops  = &fops,
 };
 
+/* ==========================================================
+ * 启动注册核心
+ * 请利用你的 hijack_arm64 引擎绑定下面两个函数！
+ * ========================================================== */
+
+/* 声明你框架中 hijack_arm64.o 提供的方法 (按你项目实际定义的宏修改) */
+extern int hijack_start(void *target, void *new_func, void **old_func);
+
 int wuwa_hbp_init_device(void) {
-    int ret;
     unsigned long pf_addr, ss_addr;
 
-    /* [核心改动]：利用框架的无视黑名单查询机制，获取底层物理硬地址 */
     pf_addr = kallsyms_lookup_name_ex("do_page_fault");
-    if (!pf_addr) {
-        pr_err("[stealth_engine] Cannot find hard address for do_page_fault\n");
+    ss_addr = kallsyms_lookup_name_ex("single_step_handler");
+
+    if (!pf_addr || !ss_addr) {
+        pr_err("[stealth_engine] Cannot find core fault handlers.\n");
         return -ENOSYS;
+    }
+
+    /* * 【核心改动：Inline Hook 注册】
+     * 抛弃 Kprobe，调用你编译进来的 hijack_arm64 内联引擎。
+     * 如果你框架里的函数名叫 inline_hook 或者别的，请在这里自行替换！
+     */
+    if (hijack_start((void *)pf_addr, (void *)stealth_do_page_fault, (void **)&orig_do_page_fault) < 0) {
+        pr_err("[stealth_engine] Inline hook failed on do_page_fault\n");
+        return -EINVAL;
     }
     
-    ss_addr = kallsyms_lookup_name_ex("single_step_handler");
-    if (!ss_addr) {
-        pr_err("[stealth_engine] Cannot find hard address for single_step_handler\n");
-        return -ENOSYS;
+    if (hijack_start((void *)ss_addr, (void *)stealth_single_step_handler, (void **)&orig_single_step_handler) < 0) {
+        pr_err("[stealth_engine] Inline hook failed on single_step_handler\n");
+        return -EINVAL;
     }
 
-    /* 直接赋予物理地址，废除 Kprobe 自带的无效符号查询机制 */
-    kp_pf.addr = (kprobe_opcode_t *)pf_addr;
-    kp_pf.pre_handler = pre_pf_handler;
-    ret = register_kprobe(&kp_pf);
-    if (ret < 0) {
-        pr_err("[stealth_engine] Failed to force-register kp_pf: %d\n", ret);
-        return ret; 
-    }
-
-    kp_ss.addr = (kprobe_opcode_t *)ss_addr;
-    kp_ss.pre_handler = pre_ss_handler;
-    ret = register_kprobe(&kp_ss);
-    if (ret < 0) {
-        unregister_kprobe(&kp_pf);
-        pr_err("[stealth_engine] Failed to force-register kp_ss: %d\n", ret);
-        return ret;
-    }
-
+    pr_info("[stealth_engine] Ultimate PTE UXN Engine Armed via Inline Hook!\n");
     return misc_register(&misc_dev);
 }
 
 void wuwa_hbp_cleanup_device(void) {
-    unregister_kprobe(&kp_pf);
-    unregister_kprobe(&kp_ss);
+    /* * 如果你的框架有 unhook 函数 (如 hijack_stop)，请在这里解除挂钩
+     * 例如: hijack_stop((void *)orig_do_page_fault);
+     */
     misc_deregister(&misc_dev);
 }
 
