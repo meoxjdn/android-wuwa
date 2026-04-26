@@ -12,23 +12,27 @@
 #include <linux/kprobes.h>
 #include <asm/pgtable.h>
 #include <asm/tlbflush.h>
+#include <asm/fpsimd.h>
 
-#define MAX_HOOKS 32
 #define DEV_NAME "stealth_uxn_engine"
+#define MAX_HOOKS 32
+#define FOV_TARGET_BITS 0x4089999AU
 
 /* ==========================================================
- * 通用通信协议 (用户态与内核态共享)
+ * 通用通信协议 & 行为定义
  * ========================================================== */
 enum hook_action {
-    ACTION_SKIP_INSTRUCTION = 0,
-    ACTION_MODIFY_REG_X0    = 1,
-    ACTION_MAX_HP_SIM       = 2
+    ACTION_RET       = 0,
+    ACTION_FOV       = 1,
+    ACTION_JMP       = 2,
+    ACTION_DAMAGE    = 3,
+    ACTION_MAXHP     = 4
 };
 
 struct hook_request {
-    uint64_t vaddr;          /* 要 Hook 的虚拟地址 */
-    uint32_t action;         /* 触发时的行为 */
-    uint64_t reg_val;        /* 附加参数 (如寄存器要修改的值) */
+    uint64_t vaddr;
+    uint32_t action;
+    uint64_t reg_val;
 };
 
 struct ioctl_init_req {
@@ -42,14 +46,14 @@ struct ioctl_init_req {
 #define CMD_CLEANUP    _IO(IOCTL_MAGIC, 2)
 
 /* ==========================================================
- * 内部状态管理 (绑定到 fd 级别防泄漏)
+ * 内部状态与 PTE 管理 (绑定 fd)
  * ========================================================== */
 struct hook_node {
     uint64_t vaddr;
     uint32_t action;
     uint64_t reg_val;
-    pte_t *ptep;             /* 页表项指针 */
-    pte_t orig_pte;          /* 原始页表项值 */
+    pte_t *ptep;
+    pte_t orig_pte;
     int active;
 };
 
@@ -61,24 +65,40 @@ struct client_ctx {
     struct mutex lock;
 };
 
-/* ==========================================================
- * 核心引擎：PTE 漫游与 UXN 修改
- * ========================================================== */
+static struct client_ctx *g_active_ctx = NULL;
+
+typedef long (*read_nofault_fn_t)(void *, const void __user *, size_t);
+typedef void (*fpsimd_save_fn_t)(struct user_fpsimd_state *);
+typedef void (*fpsimd_load_fn_t)(const struct user_fpsimd_state *);
+
+static read_nofault_fn_t  fn_nofault_read  = NULL;
+static fpsimd_save_fn_t   fn_fpsimd_save   = NULL;
+static fpsimd_load_fn_t   fn_fpsimd_load   = NULL;
+extern unsigned long kallsyms_lookup_name_ex(const char *name);
+
+static void resolve_symbols(void) {
+    if (fn_nofault_read) return;
+    fn_nofault_read = (read_nofault_fn_t)kallsyms_lookup_name_ex("copy_from_user_nofault");
+    if (!fn_nofault_read) fn_nofault_read = (read_nofault_fn_t)kallsyms_lookup_name_ex("probe_kernel_read");
+    
+    fn_fpsimd_save = (fpsimd_save_fn_t)kallsyms_lookup_name_ex("fpsimd_save_state");
+    if (!fn_fpsimd_save) fn_fpsimd_save = (fpsimd_save_fn_t)kallsyms_lookup_name_ex("fpsimd_save_and_flush_cpu_state");
+    
+    fn_fpsimd_load = (fpsimd_load_fn_t)kallsyms_lookup_name_ex("fpsimd_load_state");
+    if (!fn_fpsimd_load) fn_fpsimd_load = (fpsimd_load_fn_t)kallsyms_lookup_name_ex("fpsimd_flush_cpu_state");
+}
+
+/* 核心页表漫游机制 */
 static pte_t *walk_and_get_pte(struct mm_struct *mm, unsigned long addr) {
     pgd_t *pgd; p4d_t *p4d; pud_t *pud; pmd_t *pmd; pte_t *pte;
-
     pgd = pgd_offset(mm, addr);
     if (pgd_none(*pgd) || pgd_bad(*pgd)) return NULL;
-
     p4d = p4d_offset(pgd, addr);
     if (p4d_none(*p4d) || p4d_bad(*p4d)) return NULL;
-
     pud = pud_offset(p4d, addr);
     if (pud_none(*pud) || pud_bad(*pud)) return NULL;
-
     pmd = pmd_offset(pud, addr);
     if (pmd_none(*pmd) || pmd_bad(*pmd)) return NULL;
-
     pte = pte_offset_kernel(pmd, addr);
     return pte;
 }
@@ -89,7 +109,6 @@ static int apply_pte_uxn(struct client_ctx *ctx, struct hook_request *req, int i
     pte_t pte_val;
 
     if (!mm) return -EINVAL;
-
     mmap_read_lock(mm);
     ptep = walk_and_get_pte(mm, req->vaddr);
     if (!ptep || !pte_present(*ptep)) {
@@ -103,13 +122,13 @@ static int apply_pte_uxn(struct client_ctx *ctx, struct hook_request *req, int i
     ctx->hooks[index].ptep = ptep;
     ctx->hooks[index].orig_pte = *ptep;
 
-    /* 设置 UXN (Unprivileged Execute Never) 位 */
+    /* 赋予不可执行权限 UXN */
     pte_val = *ptep;
     pte_val = set_pte_bit(pte_val, __pgprot(PTE_UXN));
     set_pte_at(mm, req->vaddr, ptep, pte_val);
     
-    /* 刷新 TLB 确保生效 */
-    flush_tlb_page(ctx->task->active_mm->mmap, req->vaddr);
+    /* 解决 Android15-6.6 内核编译报错：彻底废弃 mm->mmap 链表，使用兼容的刷新宏 */
+    flush_tlb_mm(mm);
     
     ctx->hooks[index].active = 1;
     mmap_read_unlock(mm);
@@ -119,7 +138,6 @@ static int apply_pte_uxn(struct client_ctx *ctx, struct hook_request *req, int i
 static void restore_all_ptes(struct client_ctx *ctx) {
     struct mm_struct *mm;
     int i;
-
     if (!ctx || !ctx->task || !ctx->task->mm) return;
     mm = ctx->task->mm;
 
@@ -127,7 +145,7 @@ static void restore_all_ptes(struct client_ctx *ctx) {
     for (i = 0; i < ctx->hook_count; i++) {
         if (ctx->hooks[i].active && ctx->hooks[i].ptep) {
             set_pte_at(mm, ctx->hooks[i].vaddr, ctx->hooks[i].ptep, ctx->hooks[i].orig_pte);
-            flush_tlb_page(mm->mmap, ctx->hooks[i].vaddr);
+            flush_tlb_mm(mm);
             ctx->hooks[i].active = 0;
         }
     }
@@ -135,56 +153,75 @@ static void restore_all_ptes(struct client_ctx *ctx) {
 }
 
 /* ==========================================================
- * 异常捕获 (Instruction Abort & Timer Spoofing)
+ * Kprobe 异常捕获 (核心拦截逻辑)
  * ========================================================== */
-/* * 注意：在真实产品中，需要用 kprobe hook do_el0_instruction_abort 或 do_mem_abort
- * 这里展示一个 kprobe 骨架用于捕获异常并分配逻辑。
- */
 static struct kprobe kp_mem_abort;
 
 static int pre_mem_abort_handler(struct kprobe *p, struct pt_regs *regs) {
-    /* * 在这里检查触发异常的地址 (regs->pc) 是否在我们的 ctx->hooks 列表中。
-     * 如果匹配：
-     * 1. 模拟该指令或根据 action 跳过 (regs->pc += 4)
-     * 2. 如果是修改寄存器，直接修改 regs->regs[0] 等。
-     * 3. 返回非零值以阻止原始内核缺页异常继续处理。
-     */
-     // TODO: 遍历所有 active fd 的 ctx，匹配 regs->pc
-    return 0;
-}
+    /* ARM64 AAPCS: do_mem_abort 异常时，真实的 fault regs 保存在 x2 寄存器 */
+    struct pt_regs *fault_regs = (struct pt_regs *)regs->regs[2];
+    uint64_t pc;
+    int i;
 
-/* * 时钟伪造拦截：反作弊会读取 CNTVCT_EL0
- * 我们需要在系统层面清空 CNTKCTL_EL1.EL0VCTEN，迫使 MRS 陷阱到内核，
- * 然后在此处扣除我们执行 Hook 所耗费的 Time Delta。
- */
-static struct kprobe kp_undef_instr;
-static int pre_undef_handler(struct kprobe *p, struct pt_regs *regs) {
-    /* 检查是否是 MRS Xn, CNTVCT_EL0 指令 (opcode = 0xd53b0df0) */
-    uint32_t opcode;
-    if (copy_from_user(&opcode, (void __user *)regs->pc, 4) == 0) {
-        if ((opcode & 0xFFFFFFE0) == 0xD53B0DE0) { // 掩码匹配 MRS 时钟寄存器
-            int target_reg = opcode & 0x1F;
-            /* 读取真实时间，减去固定的异常损耗 (例如 2500 cycle)，写回寄存器 */
-            uint64_t fake_time;
-            asm volatile("mrs %0, cntvct_el0" : "=r" (fake_time));
-            fake_time -= 2500; 
-            regs->regs[target_reg] = fake_time;
-            regs->pc += 4; /* 跳过该指令 */
-            return 1; /* 拦截成功，不再传递给原 undef handler */
+    if (!fault_regs || !g_active_ctx) return 0;
+    pc = fault_regs->pc;
+
+    for (i = 0; i < g_active_ctx->hook_count; i++) {
+        if (g_active_ctx->hooks[i].active && pc == g_active_ctx->hooks[i].vaddr) {
+            uint32_t action = g_active_ctx->hooks[i].action;
+
+            if (action == ACTION_RET) {
+                fault_regs->pc = fault_regs->regs[30];
+            } 
+            else if (action == ACTION_JMP) {
+                fault_regs->pc = g_active_ctx->hooks[i].reg_val;
+            } 
+            else if (action == ACTION_FOV) {
+                if (fn_fpsimd_save && fn_fpsimd_load) {
+                    struct user_fpsimd_state *fp = &current->thread.uw.fpsimd_state;
+                    fn_fpsimd_save(fp);
+                    fp->vregs[0] = (fp->vregs[0] & ~((__uint128_t)0xFFFFFFFFULL)) | (__uint128_t)FOV_TARGET_BITS;
+                    fn_fpsimd_load(fp);
+                }
+                fault_regs->pc = fault_regs->regs[30];
+            }
+            else if (action == ACTION_MAXHP) {
+                fault_regs->regs[0] = 1;
+                fault_regs->pc = fault_regs->regs[30];
+            }
+            else if (action == ACTION_DAMAGE) {
+                uint32_t flag = 0;
+                uint64_t target_addr = fault_regs->regs[1] + 0x1C;
+                if (fn_nofault_read && fn_nofault_read(&flag, (void __user *)target_addr, 4) == 0) {
+                    if (flag == 1) { 
+                        fault_regs->regs[19] = fault_regs->regs[1]; 
+                        fault_regs->pc += 4; 
+                        /* 强行跳过当前指令模拟，让系统不触发 SIGSEGV */
+                        instruction_pointer_set(regs, regs->pc + 4);
+                        return 1; 
+                    }
+                }
+                fault_regs->sp += 0x30;
+                fault_regs->regs[0] = 1;
+                fault_regs->pc = fault_regs->regs[30];
+            }
+            
+            /* 修改完上下文后，让原本的异常处理函数（do_mem_abort）被抑制，直接返回用户态 */
+            instruction_pointer_set(regs, regs->pc + 4); 
+            return 1; 
         }
     }
     return 0;
 }
 
 /* ==========================================================
- * 文件操作接口 (防泄漏机制核心)
+ * 控制端 IOCTL 接口
  * ========================================================== */
 static int dev_open(struct inode *inode, struct file *file) {
     struct client_ctx *ctx = kzalloc(sizeof(struct client_ctx), GFP_KERNEL);
     if (!ctx) return -ENOMEM;
-    
     mutex_init(&ctx->lock);
-    file->private_data = ctx; /* 绑定生命周期 */
+    file->private_data = ctx;
     return 0;
 }
 
@@ -192,10 +229,9 @@ static int dev_release(struct inode *inode, struct file *file) {
     struct client_ctx *ctx = file->private_data;
     if (ctx) {
         mutex_lock(&ctx->lock);
-        restore_all_ptes(ctx); /* 自动清理恢复所有修改过的页表 */
-        if (ctx->task) {
-            put_task_struct(ctx->task);
-        }
+        restore_all_ptes(ctx);
+        if (ctx->task) put_task_struct(ctx->task);
+        if (g_active_ctx == ctx) g_active_ctx = NULL;
         mutex_unlock(&ctx->lock);
         kfree(ctx);
     }
@@ -209,13 +245,13 @@ static long dev_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
     int i, ret = 0;
 
     if (!ctx) return -EINVAL;
+    resolve_symbols();
 
     switch (cmd) {
         case CMD_INIT_HOOKS:
             if (copy_from_user(&req, (void __user *)arg, sizeof(req))) return -EFAULT;
-            
             mutex_lock(&ctx->lock);
-            if (ctx->task) put_task_struct(ctx->task); /* 清理旧任务 */
+            if (ctx->task) put_task_struct(ctx->task);
             
             pid_struct = find_get_pid(req.pid);
             if (!pid_struct) { mutex_unlock(&ctx->lock); return -ESRCH; }
@@ -226,10 +262,9 @@ static long dev_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
             
             ctx->target_pid = req.pid;
             ctx->hook_count = req.hook_count > MAX_HOOKS ? MAX_HOOKS : req.hook_count;
-            
-            for (i = 0; i < ctx->hook_count; i++) {
-                apply_pte_uxn(ctx, &req.hooks[i], i);
-            }
+            g_active_ctx = ctx;
+
+            for (i = 0; i < ctx->hook_count; i++) apply_pte_uxn(ctx, &req.hooks[i], i);
             mutex_unlock(&ctx->lock);
             break;
 
@@ -259,19 +294,19 @@ static struct miscdevice misc_dev = {
     .fops  = &fops,
 };
 
+/* 原 Socket API 兼容占位 (防报错) */
+int wuwa_install_perf_hbp(void *req) { return 0; }
+void wuwa_cleanup_perf_hbp(void) { }
+
 static int __init uxn_engine_init(void) {
-    int ret;
-    /* 注册 Kprobes */
-    kp_undef_instr.symbol_name = "do_undefinstr";
-    kp_undef_instr.pre_handler = pre_undef_handler;
-    register_kprobe(&kp_undef_instr);
-    
-    ret = misc_register(&misc_dev);
-    return ret;
+    kp_mem_abort.symbol_name = "do_mem_abort";
+    kp_mem_abort.pre_handler = pre_mem_abort_handler;
+    register_kprobe(&kp_mem_abort);
+    return misc_register(&misc_dev);
 }
 
 static void __exit uxn_engine_exit(void) {
-    unregister_kprobe(&kp_undef_instr);
+    unregister_kprobe(&kp_mem_abort);
     misc_deregister(&misc_dev);
 }
 
