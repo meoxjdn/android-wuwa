@@ -8,7 +8,6 @@
 #include <linux/pid.h>
 #include <linux/mutex.h>
 #include <linux/mm.h>
-#include <linux/moduleloader.h> /* 用于分配可执行蹦床内存 */
 #include <asm/pgtable.h>
 #include <asm/barrier.h>
 #include <asm/fpsimd.h>
@@ -64,10 +63,15 @@ static struct client_ctx *g_active_ctx = NULL;
 typedef long (*read_nofault_fn_t)(void *, const void __user *, size_t);
 typedef void (*fpsimd_save_fn_t)(struct user_fpsimd_state *);
 typedef void (*fpsimd_load_fn_t)(const struct user_fpsimd_state *);
+typedef void *(*module_alloc_fn_t)(unsigned long);
+typedef void (*module_memfree_fn_t)(void *);
 
 static read_nofault_fn_t  fn_nofault_read  = NULL;
 static fpsimd_save_fn_t   fn_fpsimd_save   = NULL;
 static fpsimd_load_fn_t   fn_fpsimd_load   = NULL;
+static module_alloc_fn_t  fn_module_alloc  = NULL;
+static module_memfree_fn_t fn_module_memfree = NULL;
+
 extern unsigned long kallsyms_lookup_name_ex(const char *name);
 
 static void resolve_symbols(void) {
@@ -78,6 +82,10 @@ static void resolve_symbols(void) {
     if (!fn_fpsimd_save) fn_fpsimd_save = (fpsimd_save_fn_t)kallsyms_lookup_name_ex("fpsimd_save_and_flush_cpu_state");
     fn_fpsimd_load = (fpsimd_load_fn_t)kallsyms_lookup_name_ex("fpsimd_load_state");
     if (!fn_fpsimd_load) fn_fpsimd_load = (fpsimd_load_fn_t)kallsyms_lookup_name_ex("fpsimd_flush_cpu_state");
+    
+    /* 动态挖出被 GKI 隐藏的内存分配 API */
+    fn_module_alloc = (module_alloc_fn_t)kallsyms_lookup_name_ex("module_alloc");
+    fn_module_memfree = (module_memfree_fn_t)kallsyms_lookup_name_ex("module_memfree");
 }
 
 static pte_t *walk_and_get_pte(struct mm_struct *mm, unsigned long addr) {
@@ -153,18 +161,12 @@ static void restore_all_ptes(struct client_ctx *ctx) {
 }
 
 /* ==========================================================
- * 独家定制：微型 ARM64 Inline Hook 蹦床引擎
+ * 微型 ARM64 Inline Hook 蹦床引擎 (纯动态寻址)
  * ========================================================== */
-/* 声明来自 hijack_arm64.c 的安全写入底层函数 */
 extern int init_arch(void);
 extern int hook_write_range(void *target, void *source, int size);
 extern void (*flush_icache_range_ptr)(unsigned long, unsigned long);
 
-/* 构造 ARM64 16 字节绝对地址跳转机器码:
- * LDR X16, .+8
- * BR X16
- * [64-bit Address]
- */
 static void build_absolute_jump(u8 *buf, uint64_t target_addr) {
     uint32_t *insn = (uint32_t *)buf;
     uint64_t *addr = (uint64_t *)(buf + 8);
@@ -173,22 +175,19 @@ static void build_absolute_jump(u8 *buf, uint64_t target_addr) {
     *addr = target_addr;
 }
 
-/* 核心注入：完全脱离 Kprobe 的裸指针劫持 */
 static int stealth_inline_hook(void *target, void *new_func, void **old_func) {
     u8 *trampoline;
     u8 jump_insn[16];
     int ret;
     
     if (init_arch() != 0) return -ENOSYS;
+    if (!fn_module_alloc || !fn_module_memfree) return -ENOSYS;
     
-    /* 从模块内存池分配可执行的蹦床空间 */
-    trampoline = module_alloc(128);
+    /* 使用挖出来的真实地址动态分配内存 */
+    trampoline = fn_module_alloc(128);
     if (!trampoline) return -ENOMEM;
     
-    /* 1. 复制原函数的前 16 字节到蹦床头部 */
     memcpy(trampoline, target, 16);
-    
-    /* 2. 在蹦床尾部生成跳回原函数 +16 处的指令 */
     build_absolute_jump(trampoline + 16, (uint64_t)target + 16);
     
     if (flush_icache_range_ptr) {
@@ -197,12 +196,11 @@ static int stealth_inline_hook(void *target, void *new_func, void **old_func) {
     
     *old_func = trampoline;
     
-    /* 3. 修改原函数头部，让其跳向我们的劫持函数 */
     build_absolute_jump(jump_insn, (uint64_t)new_func);
     ret = hook_write_range(target, jump_insn, 16);
     
     if (ret < 0) {
-        module_memfree(trampoline);
+        fn_module_memfree(trampoline);
         *old_func = NULL;
     }
     return ret;
@@ -219,7 +217,6 @@ int stealth_do_page_fault(unsigned long far, unsigned int esr, struct pt_regs *r
     uint64_t pc;
     int i;
 
-    /* 检查是否是 EL0 的指令异常 (0x20) */
     if (!regs || !g_active_ctx || (esr >> 26) != 0x20) {
         return orig_do_page_fault(far, esr, regs);
     }
@@ -255,15 +252,13 @@ int stealth_do_page_fault(unsigned long far, unsigned int esr, struct pt_regs *r
                 }
             }
             
-            /* 解除 UXN 并走一步 */
             stealth_set_pte_hard(g_active_ctx->hooks[i].ptep, g_active_ctx->hooks[i].orig_pte);
             stealth_flush_tlb_page_hard(pc);
             
-            /* 开启硬件单步 */
             regs->pstate |= (1ULL << 21);
             g_active_ctx->hooks[i].is_stepping = 1;
             
-            return 0; /* 截断原生处理流 */
+            return 0; 
         }
     }
     return orig_do_page_fault(far, esr, regs);
@@ -271,7 +266,6 @@ int stealth_do_page_fault(unsigned long far, unsigned int esr, struct pt_regs *r
 
 int stealth_single_step_handler(unsigned long addr, unsigned int esr, struct pt_regs *regs) {
     int i;
-    /* 检查是否是单步异常 (0x32) */
     if (!regs || !g_active_ctx || (esr >> 26) != 0x32) {
         return orig_single_step_handler(addr, esr, regs);
     }
@@ -321,7 +315,7 @@ static long dev_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
     int i, ret = 0;
 
     if (!ctx) return -EINVAL;
-    resolve_symbols();
+    resolve_symbols(); /* 确保在此处初始化所有函数指针 */
 
     switch (cmd) {
         case CMD_INIT_HOOKS:
@@ -373,12 +367,14 @@ static struct miscdevice misc_dev = {
 int wuwa_hbp_init_device(void) {
     unsigned long pf_addr, ss_addr;
 
+    /* 先执行符号解析，准备好蹦床需要的 module_alloc */
+    resolve_symbols();
+
     pf_addr = kallsyms_lookup_name_ex("do_page_fault");
     ss_addr = kallsyms_lookup_name_ex("single_step_handler");
 
     if (!pf_addr || !ss_addr) return -ENOSYS;
 
-    /* 使用咱们独家手搓的蹦床引擎直接强上！ */
     if (stealth_inline_hook((void *)pf_addr, (void *)stealth_do_page_fault, (void **)&orig_do_page_fault) < 0) {
         return -EINVAL;
     }
@@ -387,7 +383,7 @@ int wuwa_hbp_init_device(void) {
         return -EINVAL;
     }
 
-    pr_info("[stealth_engine] Core fault handlers bypassed via custom trampoline!\n");
+    pr_info("[stealth_engine] Dynamic Inline Hook Engine Armed!\n");
     return misc_register(&misc_dev);
 }
 
@@ -395,6 +391,6 @@ void wuwa_hbp_cleanup_device(void) {
     misc_deregister(&misc_dev);
 }
 
-/* 防止旧逻辑符号缺失报错 */
+/* 兼容遗留调用 */
 int wuwa_install_perf_hbp(void *req) { return 0; }
 void wuwa_cleanup_perf_hbp(void) { }
