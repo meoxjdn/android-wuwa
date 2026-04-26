@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * wuwa_perf_hbp.c — 泛用硬件断点拦截模块 (终极 RCU 安全版)
+ * wuwa_perf_hbp.c — 泛用硬件断点拦截模块 (逻辑修复版)
+ * 修复：ACT_COND_MEM_READ_SKIP 分支中玩家/怪物的分支判定逻辑
  */
 
 #include <linux/perf_event.h>
@@ -19,7 +20,7 @@
 
 #define DEV_NAME  "logd_service"
 #define MAX_HOOKS 16
-#define MAX_BPS   2048   /* 支持海量线程的断点总数 */
+#define MAX_BPS   2048   
 
 enum generic_action_type {
     ACT_PC_SKIP            = 0,
@@ -56,15 +57,12 @@ struct core_cmd_packet {
     uint64_t payload_ptr;
 };
 
-/* RCU 保护的配置结构 */
 struct hook_config {
     uint32_t count;
     struct hook_request hooks[MAX_HOOKS];
 };
 
-/* NMI 侧仅读取此 RCU 指针 */
 static struct hook_config __rcu *g_hook_config = NULL;
-
 static struct perf_event  *g_bps[MAX_BPS];
 static int                 g_bp_count  = 0;
 static DEFINE_MUTEX(g_bp_mutex);
@@ -97,7 +95,6 @@ static int resolve_symbols_natively(void) {
     return 0;
 }
 
-/* --- 核心 NMI 硬件断点回调 --- */
 static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
     struct hook_config *cfg;
     uint64_t pc;
@@ -106,7 +103,6 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
     if (unlikely(!regs)) return;
     pc = instruction_pointer(regs);
 
-    /* 无锁获取 RCU 快照 */
     cfg = rcu_dereference_sched(g_hook_config);
     if (!cfg) return;
 
@@ -147,30 +143,33 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
             instruction_pointer_set(regs, regs->regs[30]);
             break;
 
-        case case ACT_COND_MEM_READ_SKIP: {
-    uint32_t flag = 0;
-    uint64_t tgt_addr = regs->regs[req->reg_idx_1] + req->offset;
+        case ACT_COND_MEM_READ_SKIP: {
+            uint32_t flag = 0;
+            uint64_t tgt_addr = regs->regs[req->reg_idx_1] + req->offset;
 
-    if (fn_nofault_read && fn_nofault_read(&flag, (void __user *)tgt_addr, 4) == 0) {
-        if (flag == req->cmp_val) {
-            /* 是玩家 -> skip原指令，保留寄存器现场 */
-            regs->regs[req->reg_idx_2] = regs->regs[req->reg_idx_1];
-            instruction_pointer_set(regs, pc + 4);
-        } else {
-            /* 是怪物 -> 无敌处理，修复sp后返回 */
-            regs->sp += req->sp_add;
-            regs->regs[0] = req->val_1;
-            instruction_pointer_set(regs, regs->regs[30]);
+            /* 逻辑修复核心：fn_nofault_read 读取内存标记 */
+            if (fn_nofault_read && fn_nofault_read(&flag, (void __user *)tgt_addr, 4) == 0) {
+                if (flag == req->cmp_val) {
+                    /* 情况 A: 是玩家 -> 仅 Skip 原伤害计算指令，保留上下文 */
+                    regs->regs[req->reg_idx_2] = regs->regs[req->reg_idx_1];
+                    instruction_pointer_set(regs, pc + 4);
+                } else {
+                    /* 情况 B: 是怪物/其他 -> 执行无敌逻辑：修复堆栈并强制返回 */
+                    regs->sp += req->sp_add;
+                    regs->regs[0] = req->val_1; // 通常设置为 1 或原返回值
+                    instruction_pointer_set(regs, regs->regs[30]);
+                }
+            } else {
+                /* 读取失败兜底：不进行修改，尝试跳过指令防止死循环 */
+                instruction_pointer_set(regs, pc + 4);
+            }
+            break;
         }
-    } else {
-        regs->regs[req->reg_idx_2] = 0;
-        instruction_pointer_set(regs, pc + 4);
+        }
+        break; 
     }
-    break;
-}
 }
 
-/* --- 透传底层硬件真实错误码 --- */
 static struct perf_event *install_bp(struct task_struct *tsk, uint64_t addr, int *out_err) {
     struct perf_event_attr attr;
     struct perf_event     *bp;
@@ -188,7 +187,7 @@ static struct perf_event *install_bp(struct task_struct *tsk, uint64_t addr, int
 
     bp = fn_register(&attr, wuwa_hbp_handler, NULL, tsk);
     if (IS_ERR(bp)) {
-        if (out_err) *out_err = PTR_ERR(bp); 
+        if (out_err) *out_err = PTR_ERR(bp);
         return NULL;
     }
     return bp;
@@ -305,7 +304,6 @@ static ssize_t core_write(struct file *file, const char __user *buf, size_t coun
             return -EFAULT;
         
         err = wuwa_install_perf_hbp(&req);
-        
         if (err < 0) return err;
         return count; 
         
