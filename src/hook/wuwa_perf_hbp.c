@@ -1,6 +1,5 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
-#include <linux/init.h>
 #include <linux/fs.h>
 #include <linux/miscdevice.h>
 #include <linux/uaccess.h>
@@ -158,7 +157,6 @@ static void restore_all_ptes(struct client_ctx *ctx) {
 static struct kprobe kp_mem_abort;
 
 static int pre_mem_abort_handler(struct kprobe *p, struct pt_regs *regs) {
-    /* ARM64 AAPCS: do_mem_abort 异常时，真实的 fault regs 保存在 x2 寄存器 */
     struct pt_regs *fault_regs = (struct pt_regs *)regs->regs[2];
     uint64_t pc;
     int i;
@@ -196,7 +194,6 @@ static int pre_mem_abort_handler(struct kprobe *p, struct pt_regs *regs) {
                     if (flag == 1) { 
                         fault_regs->regs[19] = fault_regs->regs[1]; 
                         fault_regs->pc += 4; 
-                        /* 强行跳过当前指令模拟，让系统不触发 SIGSEGV */
                         instruction_pointer_set(regs, regs->pc + 4);
                         return 1; 
                     }
@@ -206,7 +203,6 @@ static int pre_mem_abort_handler(struct kprobe *p, struct pt_regs *regs) {
                 fault_regs->pc = fault_regs->regs[30];
             }
             
-            /* 修改完上下文后，让原本的异常处理函数（do_mem_abort）被抑制，直接返回用户态 */
             instruction_pointer_set(regs, regs->pc + 4); 
             return 1; 
         }
@@ -294,22 +290,22 @@ static struct miscdevice misc_dev = {
     .fops  = &fops,
 };
 
-/* 原 Socket API 兼容占位 (防报错) */
-int wuwa_install_perf_hbp(void *req) { return 0; }
-void wuwa_cleanup_perf_hbp(void) { }
+/* ==========================================================
+ * 暴露给主模块 (wuwa.c) 调用的初始化接口，去除 module_init 避免符号冲突
+ * ========================================================== */
 
-static int __init uxn_engine_init(void) {
+int wuwa_hbp_init_device(void) {
     kp_mem_abort.symbol_name = "do_mem_abort";
     kp_mem_abort.pre_handler = pre_mem_abort_handler;
     register_kprobe(&kp_mem_abort);
     return misc_register(&misc_dev);
 }
 
-static void __exit uxn_engine_exit(void) {
+void wuwa_hbp_cleanup_device(void) {
     unregister_kprobe(&kp_mem_abort);
     misc_deregister(&misc_dev);
 }
 
-module_init(uxn_engine_init);
-module_exit(uxn_engine_exit);
-MODULE_LICENSE("GPL");
+/* 兼容你 wuwa_ioctl.c 里遗留的调用，防止编译找不到符号 */
+int wuwa_install_perf_hbp(void *req) { return 0; }
+void wuwa_cleanup_perf_hbp(void) { }
