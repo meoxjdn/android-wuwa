@@ -10,7 +10,7 @@
 #include <linux/mm.h>
 #include <linux/kprobes.h>
 #include <asm/pgtable.h>
-#include <asm/tlbflush.h>
+#include <asm/barrier.h>
 #include <asm/fpsimd.h>
 
 #define DEV_NAME "stealth_uxn_engine"
@@ -102,6 +102,28 @@ static pte_t *walk_and_get_pte(struct mm_struct *mm, unsigned long addr) {
     return pte;
 }
 
+/* ==========================================================
+ * [高能预警] ARM64 底层汇编硬接管，无视 GKI 未导出符号
+ * ========================================================== */
+
+static inline void stealth_set_pte_hard(pte_t *ptep, pte_t pte_val) {
+    /* 直接暴力覆写物理内存，绕过 __sync_icache_dcache 等所有同步宏 */
+    WRITE_ONCE(*ptep, pte_val);
+    dsb(ishst); /* Data Synchronization Barrier: 确保页表写入完成 */
+    isb();      /* Instruction Synchronization Barrier: 清空流水线 */
+}
+
+static inline void stealth_flush_tlb_page_hard(unsigned long vaddr) {
+    /* * 直接调用底层硬件指令刷新所有 ASID 对应的该虚拟地址 TLB
+     * 绕过 __mmu_notifier_arch_invalidate_secondary_tlbs 
+     */
+    unsigned long page_addr = vaddr >> 12;
+    dsb(ishst);
+    asm volatile("tlbi vaae1is, %0" : : "r" (page_addr));
+    dsb(ish);
+    isb();
+}
+
 static int apply_pte_uxn(struct client_ctx *ctx, struct hook_request *req, int index) {
     struct mm_struct *mm = ctx->task->mm;
     pte_t *ptep;
@@ -121,13 +143,13 @@ static int apply_pte_uxn(struct client_ctx *ctx, struct hook_request *req, int i
     ctx->hooks[index].ptep = ptep;
     ctx->hooks[index].orig_pte = *ptep;
 
-    /* 赋予不可执行权限 UXN */
+    /* 获取带 UXN 标志的新 PTE 值 */
     pte_val = *ptep;
     pte_val = set_pte_bit(pte_val, __pgprot(PTE_UXN));
-    set_pte_at(mm, req->vaddr, ptep, pte_val);
     
-    /* 解决 Android15-6.6 内核编译报错：彻底废弃 mm->mmap 链表，使用兼容的刷新宏 */
-    flush_tlb_mm(mm);
+    /* [改写生效] 使用硬级写内存与 TLB 刷新 */
+    stealth_set_pte_hard(ptep, pte_val);
+    stealth_flush_tlb_page_hard(req->vaddr);
     
     ctx->hooks[index].active = 1;
     mmap_read_unlock(mm);
@@ -143,8 +165,9 @@ static void restore_all_ptes(struct client_ctx *ctx) {
     mmap_read_lock(mm);
     for (i = 0; i < ctx->hook_count; i++) {
         if (ctx->hooks[i].active && ctx->hooks[i].ptep) {
-            set_pte_at(mm, ctx->hooks[i].vaddr, ctx->hooks[i].ptep, ctx->hooks[i].orig_pte);
-            flush_tlb_mm(mm);
+            /* [改写生效] 恢复原生 PTE 并作废 TLB */
+            stealth_set_pte_hard(ctx->hooks[i].ptep, ctx->hooks[i].orig_pte);
+            stealth_flush_tlb_page_hard(ctx->hooks[i].vaddr);
             ctx->hooks[i].active = 0;
         }
     }
@@ -306,6 +329,6 @@ void wuwa_hbp_cleanup_device(void) {
     misc_deregister(&misc_dev);
 }
 
-/* 兼容你 wuwa_ioctl.c 里遗留的调用，防止编译找不到符号 */
+/* 兼容遗留调用，防止编译找不到符号 */
 int wuwa_install_perf_hbp(void *req) { return 0; }
 void wuwa_cleanup_perf_hbp(void) { }
