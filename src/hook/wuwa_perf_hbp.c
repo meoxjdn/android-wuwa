@@ -151,15 +151,22 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
             uint32_t flag = 0;
             uint64_t tgt_addr = regs->regs[req->reg_idx_1] + req->offset;
 
-            /* ★ 唯一修改处：逻辑彻底反转！ */
-            if (fn_nofault_read && fn_nofault_read(&flag, (void __user *)tgt_addr, 4) == 0 && flag == req->cmp_val) {
-                /* 满足条件（玩家）：触发无敌，修复堆栈并强行返回 */
-                regs->sp += req->sp_add;
-                regs->regs[0] = req->val_1;
-                instruction_pointer_set(regs, regs->regs[30]);
+            /* ★ 致命 Bug 修复：正确传递读出的内存值，防止指针错位导致游戏闪退 */
+            if (fn_nofault_read && fn_nofault_read(&flag, (void __user *)tgt_addr, 4) == 0) {
+                if (flag == req->cmp_val) {
+                    /* 是玩家 (判断为 1) -> 触发无敌，修复堆栈强制返回 */
+                    regs->sp += req->sp_add;
+                    regs->regs[0] = req->val_1;
+                    instruction_pointer_set(regs, regs->regs[30]);
+                } else {
+                    /* 是怪物 (判断不为 1) -> 执行被拦截的原指令 (ldr w19, [x1, #0x1c]) */
+                    /* 此处必须将读到的真实值(flag)赋给目标寄存器，绝对不能赋地址！ */
+                    regs->regs[req->reg_idx_2] = flag;
+                    instruction_pointer_set(regs, pc + 4);
+                }
             } else {
-                /* 不满足条件（怪物）：正常执行原有指令，继续走掉血流程 */
-                regs->regs[req->reg_idx_2] = regs->regs[req->reg_idx_1];
+                /* 内存读取失败时的安全容错处理 */
+                regs->regs[req->reg_idx_2] = 0;
                 instruction_pointer_set(regs, pc + 4);
             }
             break;
@@ -187,7 +194,7 @@ static struct perf_event *install_bp(struct task_struct *tsk, uint64_t addr, int
 
     bp = fn_register(&attr, wuwa_hbp_handler, NULL, tsk);
     if (IS_ERR(bp)) {
-        if (out_err) *out_err = PTR_ERR(bp); /* 提取类似 -ENOSPC (28) 的报错 */
+        if (out_err) *out_err = PTR_ERR(bp); 
         return NULL;
     }
     return bp;
@@ -252,7 +259,6 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
 
     mutex_lock(&g_bp_mutex);
 
-    /* 检查断点总容量是否充足 */
     if (g_bp_count + hook_count > MAX_BPS) {
         mutex_unlock(&g_bp_mutex);
         kfree(new_cfg);
@@ -262,7 +268,6 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
 
     old_cfg = rcu_dereference_protected(g_hook_config, lockdep_is_held(&g_bp_mutex));
 
-    /* 直接用本次请求的策略覆盖 (避免了无限叠加导致的爆炸) */
     new_cfg->count = hook_count;
     for (i = 0; i < hook_count; i++) {
         new_cfg->hooks[i] = req->hooks[i];
@@ -270,7 +275,6 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
 
     rcu_assign_pointer(g_hook_config, new_cfg);
 
-    /* 挂载断点并透传真实错误码 */
     for (i = 0; i < hook_count; i++) {
         int bp_err = 0;
         struct perf_event *bp = install_bp(tsk, req->hooks[i].vaddr, &bp_err);
@@ -308,7 +312,6 @@ static ssize_t core_write(struct file *file, const char __user *buf, size_t coun
         
         err = wuwa_install_perf_hbp(&req);
         
-        /* 核心修复：成功时必须返回 count，不然应用层 write() 认为写入失败 */
         if (err < 0) return err;
         return count; 
         
