@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * logd_service.c — 通用硬件断点拦截模块（终极 Sched-RCU 安全版）
- * * 架构特性：
- * 1. NMI 侧：零锁、零等待、纯 Sched RCU 读取，免疫 CONFIG_PREEMPT_RCU 陷阱。
- * 2. 控制侧：Mutex 保护状态写入 -> rcu_assign_pointer 瞬间切换 -> 
- * unlock -> synchronize_rcu 等待宽限期 -> kfree 安全回收。
+ * wuwa_perf_hbp.c — 泛用硬件断点拦截模块 (终极 RCU 安全版)
  */
 
 #include <linux/perf_event.h>
@@ -23,7 +19,7 @@
 
 #define DEV_NAME  "logd_service"
 #define MAX_HOOKS 16
-#define MAX_BPS   128
+#define MAX_BPS   2048   /* 支持海量线程的断点总数 */
 
 enum generic_action_type {
     ACT_PC_SKIP            = 0,
@@ -60,24 +56,19 @@ struct core_cmd_packet {
     uint64_t payload_ptr;
 };
 
-/* ------------------------------------------------------------------ */
-/* RCU 保护的数据结构                                                  */
-/* ------------------------------------------------------------------ */
+/* RCU 保护的配置结构 */
 struct hook_config {
     uint32_t count;
     struct hook_request hooks[MAX_HOOKS];
 };
 
-/* 全局 RCU 指针，NMI handler 侧纯读 */
+/* NMI 侧仅读取此 RCU 指针 */
 static struct hook_config __rcu *g_hook_config = NULL;
 
 static struct perf_event  *g_bps[MAX_BPS];
 static int                 g_bp_count  = 0;
 static DEFINE_MUTEX(g_bp_mutex);
 
-/* ------------------------------------------------------------------ */
-/* 符号解析                                                            */
-/* ------------------------------------------------------------------ */
 typedef struct perf_event *(*reg_fn_t)(struct perf_event_attr *, perf_overflow_handler_t, void *, struct task_struct *);
 typedef void  (*unreg_fn_t)(struct perf_event *);
 typedef long  (*read_nofault_fn_t)(void *, const void __user *, size_t);
@@ -106,9 +97,7 @@ static int resolve_symbols_natively(void) {
     return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* 断点处理函数（NMI / 中断上下文）                                     */
-/* ------------------------------------------------------------------ */
+/* --- 核心 NMI 硬件断点回调 --- */
 static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
     struct hook_config *cfg;
     uint64_t pc;
@@ -117,9 +106,7 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
     if (unlikely(!regs)) return;
     pc = instruction_pointer(regs);
 
-    /* * 核心安全区：使用 Sched RCU 替代标准 RCU。
-     * 依赖 NMI 天然禁用抢占的特性，免疫 CONFIG_PREEMPT_RCU 陷阱。
-     */
+    /* 无锁获取 RCU 快照 */
     cfg = rcu_dereference_sched(g_hook_config);
     if (!cfg) return;
 
@@ -175,15 +162,19 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
             break;
         }
         }
-        break; /* 匹配执行完毕，立即退出 */
+        break; 
     }
 }
 
-static struct perf_event *install_bp(struct task_struct *tsk, uint64_t addr) {
+/* --- 透传底层硬件真实错误码 --- */
+static struct perf_event *install_bp(struct task_struct *tsk, uint64_t addr, int *out_err) {
     struct perf_event_attr attr;
     struct perf_event     *bp;
 
-    if (!fn_register) return NULL;
+    if (!fn_register) {
+        if (out_err) *out_err = -ENOSYS;
+        return NULL;
+    }
 
     hw_breakpoint_init(&attr);
     attr.bp_addr  = addr;
@@ -192,25 +183,21 @@ static struct perf_event *install_bp(struct task_struct *tsk, uint64_t addr) {
     attr.disabled = 0;
 
     bp = fn_register(&attr, wuwa_hbp_handler, NULL, tsk);
-    if (IS_ERR(bp)) return NULL;
+    if (IS_ERR(bp)) {
+        if (out_err) *out_err = PTR_ERR(bp); /* 提取类似 -ENOSPC (28) 的报错 */
+        return NULL;
+    }
     return bp;
 }
 
-/* ------------------------------------------------------------------ */
-/* 清理与卸载                                                          */
-/* ------------------------------------------------------------------ */
 void wuwa_cleanup_perf_hbp(void) {
     struct hook_config *old_cfg;
     int i;
 
     mutex_lock(&g_bp_mutex);
-
     old_cfg = rcu_dereference_protected(g_hook_config, lockdep_is_held(&g_bp_mutex));
-    
-    /* 1. 原子清空指针，切断后续 NMI handler 访问路径 */
     RCU_INIT_POINTER(g_hook_config, NULL);
 
-    /* 2. 注销所有底层硬件断点，停止产生新的异常 */
     for (i = 0; i < g_bp_count; i++) {
         if (g_bps[i] && fn_unregister) {
             fn_unregister(g_bps[i]);
@@ -218,19 +205,14 @@ void wuwa_cleanup_perf_hbp(void) {
         }
     }
     g_bp_count = 0;
-
     mutex_unlock(&g_bp_mutex);
 
-    /* 3. 同步等待当前所有 CPU 上已经处于临界区内的 NMI 执行完毕，彻底安全后释放 */
     if (old_cfg) {
         synchronize_rcu();
         kfree(old_cfg);
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* 安装断点与配置热更 (RCU Update 侧)                                   */
-/* ------------------------------------------------------------------ */
 int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     struct hook_config *new_cfg;
     struct hook_config *old_cfg;
@@ -262,49 +244,43 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     get_task_struct(tsk);
     rcu_read_unlock();
 
-    /* 准备全新数据载体 */
     new_cfg = kzalloc(sizeof(*new_cfg), GFP_KERNEL);
-    if (!new_cfg) {
-        ret = -ENOMEM;
-        goto out_task;
-    }
+    if (!new_cfg) { ret = -ENOMEM; goto out_task; }
 
     mutex_lock(&g_bp_mutex);
 
-    old_cfg = rcu_dereference_protected(g_hook_config, lockdep_is_held(&g_bp_mutex));
-    if (old_cfg) {
-        memcpy(new_cfg->hooks, old_cfg->hooks, old_cfg->count * sizeof(struct hook_request));
-        new_cfg->count = old_cfg->count;
-    }
-
-    if (g_bp_count + hook_count > MAX_BPS || new_cfg->count + hook_count > MAX_HOOKS) {
+    /* 检查断点总容量是否充足 */
+    if (g_bp_count + hook_count > MAX_BPS) {
         mutex_unlock(&g_bp_mutex);
         kfree(new_cfg);
         ret = -ENOSPC;
         goto out_task;
     }
 
-    /* 追加策略 */
+    old_cfg = rcu_dereference_protected(g_hook_config, lockdep_is_held(&g_bp_mutex));
+
+    /* 直接用本次请求的策略覆盖 (避免了无限叠加导致的爆炸) */
+    new_cfg->count = hook_count;
     for (i = 0; i < hook_count; i++) {
-        new_cfg->hooks[new_cfg->count++] = req->hooks[i];
+        new_cfg->hooks[i] = req->hooks[i];
     }
 
-    /* 指针瞬间交接，完成热更 */
     rcu_assign_pointer(g_hook_config, new_cfg);
 
-    /* 物理挂载断点 */
+    /* 挂载断点并透传真实错误码 */
     for (i = 0; i < hook_count; i++) {
-        struct perf_event *bp = install_bp(tsk, req->hooks[i].vaddr);
+        int bp_err = 0;
+        struct perf_event *bp = install_bp(tsk, req->hooks[i].vaddr, &bp_err);
         if (bp) {
             g_bps[g_bp_count++] = bp;
         } else {
-            ret = -EIO;
+            ret = bp_err;
+            /* 哪怕单个挂载失败（比如单个线程槽位满），我们也让已经挂上的继续运行，不退出 */
         }
     }
 
     mutex_unlock(&g_bp_mutex);
 
-    /* 在 mutex 外部同步等待旧快照的彻底过期，再执行安全销毁 */
     if (old_cfg) {
         synchronize_rcu();
         kfree(old_cfg);
@@ -316,12 +292,10 @@ out_task:
     return ret;
 }
 
-/* ------------------------------------------------------------------ */
-/* IOCTL 路由                                                         */
-/* ------------------------------------------------------------------ */
 static ssize_t core_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos) {
     struct core_cmd_packet pkt;
     struct wuwa_hbp_req    req;
+    int err;
 
     if (count != sizeof(pkt)) return -EINVAL;
     if (copy_from_user(&pkt, buf, sizeof(pkt))) return -EFAULT;
@@ -329,14 +303,19 @@ static ssize_t core_write(struct file *file, const char __user *buf, size_t coun
     if (pkt.cmd_id == CMD_HBP_INSTALL) {
         if (copy_from_user(&req, (void __user *)pkt.payload_ptr, sizeof(req)))
             return -EFAULT;
-        return wuwa_install_perf_hbp(&req);
+        
+        err = wuwa_install_perf_hbp(&req);
+        
+        /* 核心修复：成功时必须返回 count，不然应用层 write() 认为写入失败 */
+        if (err < 0) return err;
+        return count; 
+        
     } else if (pkt.cmd_id == CMD_HBP_CLEANUP) {
         wuwa_cleanup_perf_hbp();
-    } else {
-        return -EINVAL;
-    }
+        return count;
+    } 
 
-    return (ssize_t)count;
+    return -EINVAL;
 }
 
 static const struct file_operations core_fops = {
