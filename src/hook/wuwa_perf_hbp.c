@@ -10,11 +10,9 @@
 #include <linux/mm.h>
 #include <asm/pgtable.h>
 #include <asm/barrier.h>
-#include <asm/fpsimd.h>
 
 #define DEV_NAME "stealth_uxn_engine"
 #define MAX_HOOKS 32
-#define FOV_TARGET_BITS 0x4089999AU
 
 enum hook_action {
     ACTION_RET       = 0,
@@ -44,8 +42,7 @@ struct hook_node {
     uint64_t vaddr;
     uint32_t action;
     uint64_t reg_val;
-    pte_t *ptep;
-    pte_t orig_pte;
+    /* 【建议2生效】彻底删除 ptep 缓存指针，防止 VMA 变动引发野指针崩溃 */
     int active;
     int is_stepping; 
 };
@@ -61,14 +58,10 @@ struct client_ctx {
 static struct client_ctx *g_active_ctx = NULL;
 
 typedef long (*read_nofault_fn_t)(void *, const void __user *, size_t);
-typedef void (*fpsimd_save_fn_t)(struct user_fpsimd_state *);
-typedef void (*fpsimd_load_fn_t)(const struct user_fpsimd_state *);
 typedef void *(*module_alloc_fn_t)(unsigned long);
 typedef void (*module_memfree_fn_t)(void *);
 
 static read_nofault_fn_t  fn_nofault_read  = NULL;
-static fpsimd_save_fn_t   fn_fpsimd_save   = NULL;
-static fpsimd_load_fn_t   fn_fpsimd_load   = NULL;
 static module_alloc_fn_t  fn_module_alloc  = NULL;
 static module_memfree_fn_t fn_module_memfree = NULL;
 
@@ -78,15 +71,14 @@ static void resolve_symbols(void) {
     if (fn_nofault_read) return;
     fn_nofault_read = (read_nofault_fn_t)kallsyms_lookup_name_ex("copy_from_user_nofault");
     if (!fn_nofault_read) fn_nofault_read = (read_nofault_fn_t)kallsyms_lookup_name_ex("probe_kernel_read");
-    fn_fpsimd_save = (fpsimd_save_fn_t)kallsyms_lookup_name_ex("fpsimd_save_state");
-    if (!fn_fpsimd_save) fn_fpsimd_save = (fpsimd_save_fn_t)kallsyms_lookup_name_ex("fpsimd_save_and_flush_cpu_state");
-    fn_fpsimd_load = (fpsimd_load_fn_t)kallsyms_lookup_name_ex("fpsimd_load_state");
-    if (!fn_fpsimd_load) fn_fpsimd_load = (fpsimd_load_fn_t)kallsyms_lookup_name_ex("fpsimd_flush_cpu_state");
     
     fn_module_alloc = (module_alloc_fn_t)kallsyms_lookup_name_ex("module_alloc");
     fn_module_memfree = (module_memfree_fn_t)kallsyms_lookup_name_ex("module_memfree");
 }
 
+/* ==========================================================
+ * PTE 动态漫游层 (Dynamic PTE Walking)
+ * ========================================================== */
 static pte_t *walk_and_get_pte(struct mm_struct *mm, unsigned long addr) {
     pgd_t *pgd; p4d_t *p4d; pud_t *pud; pmd_t *pmd; pte_t *pte;
     pgd = pgd_offset(mm, addr);
@@ -115,67 +107,43 @@ static inline void stealth_flush_tlb_page_hard(unsigned long vaddr) {
     isb();
 }
 
-/* ==========================================================
- * [降维打击] 突破 GKI 限制，强制将分配的蹦床内存标记为可执行！
- * ========================================================== */
+/* 动态设置 UXN (位54) */
+static void stealth_set_uxn(struct mm_struct *mm, unsigned long vaddr) {
+    pte_t *ptep = walk_and_get_pte(mm, vaddr);
+    if (ptep && pte_present(*ptep)) {
+        unsigned long val = pte_val(*ptep);
+        val |= (1ULL << 54);
+        stealth_set_pte_hard(ptep, __pte(val));
+        stealth_flush_tlb_page_hard(vaddr);
+    }
+}
+
+/* 动态清除 UXN (位54) */
+static void stealth_clear_uxn(struct mm_struct *mm, unsigned long vaddr) {
+    pte_t *ptep = walk_and_get_pte(mm, vaddr);
+    if (ptep && pte_present(*ptep)) {
+        unsigned long val = pte_val(*ptep);
+        val &= ~(1ULL << 54);
+        stealth_set_pte_hard(ptep, __pte(val));
+        stealth_flush_tlb_page_hard(vaddr);
+    }
+}
+
 static int make_tramp_exec(void *addr) {
-    pgd_t *pgd; p4d_t *p4d; pud_t *pud; pmd_t *pmd; pte_t *ptep;
+    pte_t *ptep;
     unsigned long va = (unsigned long)addr;
     unsigned long val;
     struct mm_struct *init_mm_ptr = (struct mm_struct *)kallsyms_lookup_name_ex("init_mm");
 
-    if (!init_mm_ptr) {
-        pr_err("[stealth_engine] init_mm not found, cannot assign exec permission!\n");
-        return -ENOSYS;
-    }
-
-    pgd = pgd_offset(init_mm_ptr, va);
-    if (pgd_none(*pgd) || pgd_bad(*pgd)) return -EFAULT;
-    p4d = p4d_offset(pgd, va);
-    if (p4d_none(*p4d) || p4d_bad(*p4d)) return -EFAULT;
-    pud = pud_offset(p4d, va);
-    if (pud_none(*pud) || pud_bad(*pud)) return -EFAULT;
-    pmd = pmd_offset(pud, va);
-    if (pmd_none(*pmd) || pmd_bad(*pmd)) return -EFAULT;
-    ptep = pte_offset_kernel(pmd, va);
+    if (!init_mm_ptr) return -ENOSYS;
+    ptep = walk_and_get_pte(init_mm_ptr, va);
     if (!ptep || !pte_present(*ptep)) return -EFAULT;
 
-    /* 暴力抹除 PXN(位53) 和 UXN(位54) 标志位，强制允许指令执行 */
+    /* 暴力抹除 PXN(53) 和 UXN(54) */
     val = pte_val(*ptep);
     val &= ~((1ULL << 53) | (1ULL << 54)); 
-    
     stealth_set_pte_hard(ptep, __pte(val));
     stealth_flush_tlb_page_hard(va);
-    return 0;
-}
-
-/* ==========================================================
- * 业务 Hook 核心层 
- * ========================================================== */
-static int apply_pte_uxn(struct client_ctx *ctx, struct hook_request *req, int index) {
-    struct mm_struct *mm = ctx->task->mm;
-    pte_t *ptep;
-    pte_t pte_val;
-
-    if (!mm) return -EINVAL;
-    mmap_read_lock(mm);
-    ptep = walk_and_get_pte(mm, req->vaddr);
-    if (!ptep || !pte_present(*ptep)) { mmap_read_unlock(mm); return -EFAULT; }
-
-    ctx->hooks[index].vaddr = req->vaddr;
-    ctx->hooks[index].action = req->action;
-    ctx->hooks[index].reg_val = req->reg_val;
-    ctx->hooks[index].ptep = ptep;
-    ctx->hooks[index].orig_pte = *ptep;
-    ctx->hooks[index].is_stepping = 0;
-
-    pte_val = *ptep;
-    pte_val = set_pte_bit(pte_val, __pgprot(PTE_UXN));
-    stealth_set_pte_hard(ptep, pte_val);
-    stealth_flush_tlb_page_hard(req->vaddr);
-    
-    ctx->hooks[index].active = 1;
-    mmap_read_unlock(mm);
     return 0;
 }
 
@@ -187,9 +155,8 @@ static void restore_all_ptes(struct client_ctx *ctx) {
 
     mmap_read_lock(mm);
     for (i = 0; i < ctx->hook_count; i++) {
-        if (ctx->hooks[i].active && ctx->hooks[i].ptep) {
-            stealth_set_pte_hard(ctx->hooks[i].ptep, ctx->hooks[i].orig_pte);
-            stealth_flush_tlb_page_hard(ctx->hooks[i].vaddr);
+        if (ctx->hooks[i].active) {
+            stealth_clear_uxn(mm, ctx->hooks[i].vaddr);
             ctx->hooks[i].active = 0;
         }
     }
@@ -197,7 +164,7 @@ static void restore_all_ptes(struct client_ctx *ctx) {
 }
 
 /* ==========================================================
- * 微型 ARM64 Inline Hook 蹦床引擎 
+ * 微型 ARM64 Inline Hook 蹦床引擎
  * ========================================================== */
 extern int init_arch(void);
 extern int hook_write_range(void *target, void *source, int size);
@@ -219,11 +186,9 @@ static int stealth_inline_hook(void *target, void *new_func, void **old_func) {
     if (init_arch() != 0) return -ENOSYS;
     if (!fn_module_alloc || !fn_module_memfree) return -ENOSYS;
     
-    /* 分配一整页，避免边界问题 */
     trampoline = fn_module_alloc(PAGE_SIZE);
     if (!trampoline) return -ENOMEM;
     
-    /* 【核心修复】强制剥除内存 PXN 保护，让跳板变得可执行！ */
     if (make_tramp_exec(trampoline) != 0) {
         fn_module_memfree(trampoline);
         return -EFAULT;
@@ -263,6 +228,11 @@ int stealth_do_page_fault(unsigned long far, unsigned int esr, struct pt_regs *r
         return orig_do_page_fault(far, esr, regs);
     }
     
+    /* 【建议3生效】严格的异常上下文过滤！只处理目标游戏的异常，保全宿主系统命脉 */
+    if (!current->mm || current->mm != g_active_ctx->task->mm) {
+        return orig_do_page_fault(far, esr, regs);
+    }
+    
     pc = regs->pc;
 
     for (i = 0; i < g_active_ctx->hook_count; i++) {
@@ -273,12 +243,7 @@ int stealth_do_page_fault(unsigned long far, unsigned int esr, struct pt_regs *r
                 if (action == ACTION_RET) { regs->pc = regs->regs[30]; } 
                 else if (action == ACTION_JMP) { regs->pc = g_active_ctx->hooks[i].reg_val; } 
                 else if (action == ACTION_FOV) {
-                    if (fn_fpsimd_save && fn_fpsimd_load) {
-                        struct user_fpsimd_state *fp = &current->thread.uw.fpsimd_state;
-                        fn_fpsimd_save(fp);
-                        fp->vregs[0] = (fp->vregs[0] & ~((__uint128_t)0xFFFFFFFFULL)) | (__uint128_t)FOV_TARGET_BITS;
-                        fn_fpsimd_load(fp);
-                    }
+                    /* 【建议4生效】彻底废弃危险的 FPSIMD 操作，改用安全跳过 */
                     regs->pc = regs->regs[30];
                 }
                 else if (action == ACTION_MAXHP) { regs->regs[0] = 1; regs->pc = regs->regs[30]; }
@@ -294,8 +259,8 @@ int stealth_do_page_fault(unsigned long far, unsigned int esr, struct pt_regs *r
                 }
             }
             
-            stealth_set_pte_hard(g_active_ctx->hooks[i].ptep, g_active_ctx->hooks[i].orig_pte);
-            stealth_flush_tlb_page_hard(pc);
+            /* 动态漫游：清理 UXN 标志 */
+            stealth_clear_uxn(current->mm, g_active_ctx->hooks[i].vaddr);
             
             regs->pstate |= (1ULL << 21);
             g_active_ctx->hooks[i].is_stepping = 1;
@@ -308,15 +273,20 @@ int stealth_do_page_fault(unsigned long far, unsigned int esr, struct pt_regs *r
 
 int stealth_single_step_handler(unsigned long addr, unsigned int esr, struct pt_regs *regs) {
     int i;
+    
     if (!regs || !g_active_ctx || (esr >> 26) != 0x32) {
+        return orig_single_step_handler(addr, esr, regs);
+    }
+    
+    if (!current->mm || current->mm != g_active_ctx->task->mm) {
         return orig_single_step_handler(addr, esr, regs);
     }
 
     for (i = 0; i < g_active_ctx->hook_count; i++) {
         if (g_active_ctx->hooks[i].active && g_active_ctx->hooks[i].is_stepping) {
-            pte_t uxn_pte = set_pte_bit(g_active_ctx->hooks[i].orig_pte, __pgprot(PTE_UXN));
-            stealth_set_pte_hard(g_active_ctx->hooks[i].ptep, uxn_pte);
-            stealth_flush_tlb_page_hard(g_active_ctx->hooks[i].vaddr);
+            
+            /* 动态漫游：恢复 UXN 标志 */
+            stealth_set_uxn(current->mm, g_active_ctx->hooks[i].vaddr);
 
             regs->pstate &= ~(1ULL << 21);
             g_active_ctx->hooks[i].is_stepping = 0;
@@ -376,7 +346,18 @@ static long dev_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
             ctx->hook_count = req.hook_count > MAX_HOOKS ? MAX_HOOKS : req.hook_count;
             g_active_ctx = ctx;
 
-            for (i = 0; i < ctx->hook_count; i++) apply_pte_uxn(ctx, &req.hooks[i], i);
+            for (i = 0; i < ctx->hook_count; i++) {
+                ctx->hooks[i].vaddr = req.hooks[i].vaddr;
+                ctx->hooks[i].action = req.hooks[i].action;
+                ctx->hooks[i].reg_val = req.hooks[i].reg_val;
+                ctx->hooks[i].active = 1;
+                ctx->hooks[i].is_stepping = 0;
+                
+                /* [动态注入] 在 mmap_read_lock 保护下，仅实施一次性写入 */
+                mmap_read_lock(ctx->task->mm);
+                stealth_set_uxn(ctx->task->mm, ctx->hooks[i].vaddr);
+                mmap_read_unlock(ctx->task->mm);
+            }
             mutex_unlock(&ctx->lock);
             break;
 
@@ -426,7 +407,7 @@ int wuwa_hbp_init_device(void) {
         return -EINVAL;
     }
 
-    pr_info("[stealth_engine] Dynamic Inline Hook Engine Armed!\n");
+    pr_info("[stealth_engine] Ultimate Filtered Inline Hook Engine Armed!\n");
     return misc_register(&misc_dev);
 }
 
