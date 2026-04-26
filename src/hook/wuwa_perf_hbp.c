@@ -8,6 +8,7 @@
 #include <linux/pid.h>
 #include <linux/mutex.h>
 #include <linux/mm.h>
+#include <linux/moduleloader.h> /* 用于分配可执行蹦床内存 */
 #include <asm/pgtable.h>
 #include <asm/barrier.h>
 #include <asm/fpsimd.h>
@@ -152,32 +153,82 @@ static void restore_all_ptes(struct client_ctx *ctx) {
 }
 
 /* ==========================================================
- * 纯汇编劫持层 (Inline Hook Handlers)
- * 彻底抛弃 Kprobe，使用裸函数指针接管异常向量！
+ * 独家定制：微型 ARM64 Inline Hook 蹦床引擎
  * ========================================================== */
+/* 声明来自 hijack_arm64.c 的安全写入底层函数 */
+extern int init_arch(void);
+extern int hook_write_range(void *target, void *source, int size);
+extern void (*flush_icache_range_ptr)(unsigned long, unsigned long);
 
-/* 定义原函数的函数指针类型 */
+/* 构造 ARM64 16 字节绝对地址跳转机器码:
+ * LDR X16, .+8
+ * BR X16
+ * [64-bit Address]
+ */
+static void build_absolute_jump(u8 *buf, uint64_t target_addr) {
+    uint32_t *insn = (uint32_t *)buf;
+    uint64_t *addr = (uint64_t *)(buf + 8);
+    insn[0] = 0x58000050; 
+    insn[1] = 0xd61f0200; 
+    *addr = target_addr;
+}
+
+/* 核心注入：完全脱离 Kprobe 的裸指针劫持 */
+static int stealth_inline_hook(void *target, void *new_func, void **old_func) {
+    u8 *trampoline;
+    u8 jump_insn[16];
+    int ret;
+    
+    if (init_arch() != 0) return -ENOSYS;
+    
+    /* 从模块内存池分配可执行的蹦床空间 */
+    trampoline = module_alloc(128);
+    if (!trampoline) return -ENOMEM;
+    
+    /* 1. 复制原函数的前 16 字节到蹦床头部 */
+    memcpy(trampoline, target, 16);
+    
+    /* 2. 在蹦床尾部生成跳回原函数 +16 处的指令 */
+    build_absolute_jump(trampoline + 16, (uint64_t)target + 16);
+    
+    if (flush_icache_range_ptr) {
+        flush_icache_range_ptr((unsigned long)trampoline, (unsigned long)trampoline + 32);
+    }
+    
+    *old_func = trampoline;
+    
+    /* 3. 修改原函数头部，让其跳向我们的劫持函数 */
+    build_absolute_jump(jump_insn, (uint64_t)new_func);
+    ret = hook_write_range(target, jump_insn, 16);
+    
+    if (ret < 0) {
+        module_memfree(trampoline);
+        *old_func = NULL;
+    }
+    return ret;
+}
+
+/* ==========================================================
+ * 原生函数指针劫持区 (接管异常向量)
+ * ========================================================== */
 typedef int (*fault_handler_t)(unsigned long far, unsigned int esr, struct pt_regs *regs);
 static fault_handler_t orig_do_page_fault = NULL;
 static fault_handler_t orig_single_step_handler = NULL;
 
-/* 劫持 do_page_fault 的处理函数 */
 int stealth_do_page_fault(unsigned long far, unsigned int esr, struct pt_regs *regs) {
     uint64_t pc;
     int i;
 
     /* 检查是否是 EL0 的指令异常 (0x20) */
     if (!regs || !g_active_ctx || (esr >> 26) != 0x20) {
-        return orig_do_page_fault(far, esr, regs); /* 不是我们的目标，放行给原内核处理 */
+        return orig_do_page_fault(far, esr, regs);
     }
     
     pc = regs->pc;
 
     for (i = 0; i < g_active_ctx->hook_count; i++) {
-        /* 匹配 4KB UXN 页异常 */
         if (g_active_ctx->hooks[i].active && (pc & ~0xFFFULL) == (g_active_ctx->hooks[i].vaddr & ~0xFFFULL)) {
             
-            /* 命中 Hook 行 */
             if (pc == g_active_ctx->hooks[i].vaddr) {
                 uint32_t action = g_active_ctx->hooks[i].action;
                 if (action == ACTION_RET) { regs->pc = regs->regs[30]; } 
@@ -208,21 +259,18 @@ int stealth_do_page_fault(unsigned long far, unsigned int esr, struct pt_regs *r
             stealth_set_pte_hard(g_active_ctx->hooks[i].ptep, g_active_ctx->hooks[i].orig_pte);
             stealth_flush_tlb_page_hard(pc);
             
-            /* 开启硬件单步 (PSTATE.SS = bit 21) */
+            /* 开启硬件单步 */
             regs->pstate |= (1ULL << 21);
             g_active_ctx->hooks[i].is_stepping = 1;
             
-            return 0; /* 成功处理，强行截断原生 do_page_fault 的执行！ */
+            return 0; /* 截断原生处理流 */
         }
     }
-    
     return orig_do_page_fault(far, esr, regs);
 }
 
-/* 劫持 single_step_handler 的处理函数 */
 int stealth_single_step_handler(unsigned long addr, unsigned int esr, struct pt_regs *regs) {
     int i;
-
     /* 检查是否是单步异常 (0x32) */
     if (!regs || !g_active_ctx || (esr >> 26) != 0x32) {
         return orig_single_step_handler(addr, esr, regs);
@@ -230,16 +278,13 @@ int stealth_single_step_handler(unsigned long addr, unsigned int esr, struct pt_
 
     for (i = 0; i < g_active_ctx->hook_count; i++) {
         if (g_active_ctx->hooks[i].active && g_active_ctx->hooks[i].is_stepping) {
-            
             pte_t uxn_pte = set_pte_bit(g_active_ctx->hooks[i].orig_pte, __pgprot(PTE_UXN));
             stealth_set_pte_hard(g_active_ctx->hooks[i].ptep, uxn_pte);
             stealth_flush_tlb_page_hard(g_active_ctx->hooks[i].vaddr);
 
-            /* 关闭硬件单步 */
             regs->pstate &= ~(1ULL << 21);
             g_active_ctx->hooks[i].is_stepping = 0;
-
-            return 0; /* 成功处理，拦截到底！ */
+            return 0;
         }
     }
     return orig_single_step_handler(addr, esr, regs);
@@ -325,49 +370,31 @@ static struct miscdevice misc_dev = {
     .fops  = &fops,
 };
 
-/* ==========================================================
- * 启动注册核心
- * 请利用你的 hijack_arm64 引擎绑定下面两个函数！
- * ========================================================== */
-
-/* 声明你框架中 hijack_arm64.o 提供的方法 (按你项目实际定义的宏修改) */
-extern int hijack_start(void *target, void *new_func, void **old_func);
-
 int wuwa_hbp_init_device(void) {
     unsigned long pf_addr, ss_addr;
 
     pf_addr = kallsyms_lookup_name_ex("do_page_fault");
     ss_addr = kallsyms_lookup_name_ex("single_step_handler");
 
-    if (!pf_addr || !ss_addr) {
-        pr_err("[stealth_engine] Cannot find core fault handlers.\n");
-        return -ENOSYS;
-    }
+    if (!pf_addr || !ss_addr) return -ENOSYS;
 
-    /* * 【核心改动：Inline Hook 注册】
-     * 抛弃 Kprobe，调用你编译进来的 hijack_arm64 内联引擎。
-     * 如果你框架里的函数名叫 inline_hook 或者别的，请在这里自行替换！
-     */
-    if (hijack_start((void *)pf_addr, (void *)stealth_do_page_fault, (void **)&orig_do_page_fault) < 0) {
-        pr_err("[stealth_engine] Inline hook failed on do_page_fault\n");
+    /* 使用咱们独家手搓的蹦床引擎直接强上！ */
+    if (stealth_inline_hook((void *)pf_addr, (void *)stealth_do_page_fault, (void **)&orig_do_page_fault) < 0) {
         return -EINVAL;
     }
     
-    if (hijack_start((void *)ss_addr, (void *)stealth_single_step_handler, (void **)&orig_single_step_handler) < 0) {
-        pr_err("[stealth_engine] Inline hook failed on single_step_handler\n");
+    if (stealth_inline_hook((void *)ss_addr, (void *)stealth_single_step_handler, (void **)&orig_single_step_handler) < 0) {
         return -EINVAL;
     }
 
-    pr_info("[stealth_engine] Ultimate PTE UXN Engine Armed via Inline Hook!\n");
+    pr_info("[stealth_engine] Core fault handlers bypassed via custom trampoline!\n");
     return misc_register(&misc_dev);
 }
 
 void wuwa_hbp_cleanup_device(void) {
-    /* * 如果你的框架有 unhook 函数 (如 hijack_stop)，请在这里解除挂钩
-     * 例如: hijack_stop((void *)orig_do_page_fault);
-     */
     misc_deregister(&misc_dev);
 }
 
+/* 防止旧逻辑符号缺失报错 */
 int wuwa_install_perf_hbp(void *req) { return 0; }
 void wuwa_cleanup_perf_hbp(void) { }
