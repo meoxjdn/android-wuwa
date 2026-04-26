@@ -48,7 +48,7 @@ struct hook_node {
     pte_t *ptep;
     pte_t orig_pte;
     int active;
-    int is_stepping; /* 新增：单步状态标记 */
+    int is_stepping; 
 };
 
 struct client_ctx {
@@ -152,23 +152,27 @@ static void restore_all_ptes(struct client_ctx *ctx) {
     mmap_read_unlock(mm);
 }
 
-static struct kprobe kp_mem_abort;
-static struct kprobe kp_debug_exc;
+/* ==========================================================
+ * Kprobe 异常捕获 (移至安全函数 do_page_fault)
+ * ========================================================== */
+static struct kprobe kp_pf;
+static struct kprobe kp_ss;
 
-/* 核心一：拦截 UXN 异常并开启硬件单步 */
-static int pre_mem_abort_handler(struct kprobe *p, struct pt_regs *regs) {
+static int pre_pf_handler(struct kprobe *p, struct pt_regs *regs) {
+    /* ARM64 do_page_fault(unsigned long far, unsigned int esr, struct pt_regs *regs) */
+    unsigned int esr = regs->regs[1];
     struct pt_regs *fault_regs = (struct pt_regs *)regs->regs[2];
     uint64_t pc;
     int i;
 
-    if (!fault_regs || !g_active_ctx) return 0;
+    /* 检查是否是 EL0 的指令异常 (0x20) */
+    if (!fault_regs || !g_active_ctx || (esr >> 26) != 0x20) return 0;
+    
     pc = fault_regs->pc;
 
     for (i = 0; i < g_active_ctx->hook_count; i++) {
-        /* 只要是在同一个 4KB 内存页里触发了异常，都必须接管处理 */
         if (g_active_ctx->hooks[i].active && (pc & ~0xFFFULL) == (g_active_ctx->hooks[i].vaddr & ~0xFFFULL)) {
             
-            /* 如果正好是我们要 Hook 的那一行代码，就修改寄存器 */
             if (pc == g_active_ctx->hooks[i].vaddr) {
                 uint32_t action = g_active_ctx->hooks[i].action;
                 if (action == ACTION_RET) { fault_regs->pc = fault_regs->regs[30]; } 
@@ -195,15 +199,15 @@ static int pre_mem_abort_handler(struct kprobe *p, struct pt_regs *regs) {
                 }
             }
             
-            /* [关键修复] 无论是不是 Hook 代码，都必须解除 UXN 并让 CPU 走一步 */
+            /* 解除 UXN 并走一步 */
             stealth_set_pte_hard(g_active_ctx->hooks[i].ptep, g_active_ctx->hooks[i].orig_pte);
             stealth_flush_tlb_page_hard(pc);
             
-            /* 开启硬件单步标志位 SPSR_EL1.SS (Bit 21) */
+            /* 开启硬件单步 (PSTATE.SS = bit 21) */
             fault_regs->pstate |= (1ULL << 21);
             g_active_ctx->hooks[i].is_stepping = 1;
             
-            /* 安全退出 do_mem_abort，返回到异常向量表 */
+            /* 直接返回到 LR，相当于截断 do_page_fault 不让它继续往里走 */
             instruction_pointer_set(regs, regs->regs[30]); 
             return 1; 
         }
@@ -211,28 +215,26 @@ static int pre_mem_abort_handler(struct kprobe *p, struct pt_regs *regs) {
     return 0;
 }
 
-/* 核心二：捕获单步执行完毕，恢复 UXN */
-static int pre_debug_exception_handler(struct kprobe *p, struct pt_regs *regs) {
+static int pre_ss_handler(struct kprobe *p, struct pt_regs *regs) {
+    /* ARM64 single_step_handler(unsigned long addr, unsigned int esr, struct pt_regs *regs) */
     unsigned int esr = regs->regs[1];
     struct pt_regs *fault_regs = (struct pt_regs *)regs->regs[2];
     int i;
 
-    /* 检查是否是 EL0 触发的硬件单步异常 (ESR_ELx_EC_SOFTSTP_LOWER = 0x32) */
+    /* 检查是否是单步异常 (0x32) */
     if (!fault_regs || !g_active_ctx || (esr >> 26) != 0x32) return 0;
 
     for (i = 0; i < g_active_ctx->hook_count; i++) {
         if (g_active_ctx->hooks[i].active && g_active_ctx->hooks[i].is_stepping) {
             
-            /* 将 UXN 加回去，防止后面的指令漏网 */
             pte_t uxn_pte = set_pte_bit(g_active_ctx->hooks[i].orig_pte, __pgprot(PTE_UXN));
             stealth_set_pte_hard(g_active_ctx->hooks[i].ptep, uxn_pte);
             stealth_flush_tlb_page_hard(g_active_ctx->hooks[i].vaddr);
 
-            /* 关闭单步标志位 */
+            /* 关闭硬件单步 */
             fault_regs->pstate &= ~(1ULL << 21);
             g_active_ctx->hooks[i].is_stepping = 0;
 
-            /* 安全退出 debug_handler */
             instruction_pointer_set(regs, regs->regs[30]);
             return 1;
         }
@@ -321,21 +323,31 @@ static struct miscdevice misc_dev = {
 };
 
 int wuwa_hbp_init_device(void) {
-    kp_mem_abort.symbol_name = "do_mem_abort";
-    kp_mem_abort.pre_handler = pre_mem_abort_handler;
-    register_kprobe(&kp_mem_abort);
+    int ret;
+    
+    kp_pf.symbol_name = "do_page_fault";
+    kp_pf.pre_handler = pre_pf_handler;
+    ret = register_kprobe(&kp_pf);
+    if (ret < 0) {
+        pr_err("[stealth_engine] Failed to register kp_pf: %d\n", ret);
+        return ret; /* 安全退出，拒绝加载，不引起内核崩溃 */
+    }
 
-    /* 注册调试异常探针，专门抓取单步 */
-    kp_debug_exc.symbol_name = "do_debug_exception";
-    kp_debug_exc.pre_handler = pre_debug_exception_handler;
-    register_kprobe(&kp_debug_exc);
+    kp_ss.symbol_name = "single_step_handler";
+    kp_ss.pre_handler = pre_ss_handler;
+    ret = register_kprobe(&kp_ss);
+    if (ret < 0) {
+        unregister_kprobe(&kp_pf);
+        pr_err("[stealth_engine] Failed to register kp_ss: %d\n", ret);
+        return ret;
+    }
 
     return misc_register(&misc_dev);
 }
 
 void wuwa_hbp_cleanup_device(void) {
-    unregister_kprobe(&kp_mem_abort);
-    unregister_kprobe(&kp_debug_exc);
+    unregister_kprobe(&kp_pf);
+    unregister_kprobe(&kp_ss);
     misc_deregister(&misc_dev);
 }
 
