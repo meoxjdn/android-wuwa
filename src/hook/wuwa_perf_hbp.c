@@ -147,33 +147,27 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
             instruction_pointer_set(regs, regs->regs[30]);
             break;
 
-        case ACT_COND_MEM_READ_SKIP: {
-            uint32_t flag = 0;
-            uint64_t tgt_addr = regs->regs[req->reg_idx_1] + req->offset;
+        case case ACT_COND_MEM_READ_SKIP: {
+    uint32_t flag = 0;
+    uint64_t tgt_addr = regs->regs[req->reg_idx_1] + req->offset;
 
-            /* ★ 致命 Bug 修复：正确传递读出的内存值，防止指针错位导致游戏闪退 */
-            if (fn_nofault_read && fn_nofault_read(&flag, (void __user *)tgt_addr, 4) == 0) {
-                if (flag == req->cmp_val) {
-                    /* 是玩家 (判断为 1) -> 触发无敌，修复堆栈强制返回 */
-                    regs->sp += req->sp_add;
-                    regs->regs[0] = req->val_1;
-                    instruction_pointer_set(regs, regs->regs[30]);
-                } else {
-                    /* 是怪物 (判断不为 1) -> 执行被拦截的原指令 (ldr w19, [x1, #0x1c]) */
-                    /* 此处必须将读到的真实值(flag)赋给目标寄存器，绝对不能赋地址！ */
-                    regs->regs[req->reg_idx_2] = flag;
-                    instruction_pointer_set(regs, pc + 4);
-                }
-            } else {
-                /* 内存读取失败时的安全容错处理 */
-                regs->regs[req->reg_idx_2] = 0;
-                instruction_pointer_set(regs, pc + 4);
-            }
-            break;
+    if (fn_nofault_read && fn_nofault_read(&flag, (void __user *)tgt_addr, 4) == 0) {
+        if (flag == req->cmp_val) {
+            /* 是玩家 -> skip原指令，保留寄存器现场 */
+            regs->regs[req->reg_idx_2] = regs->regs[req->reg_idx_1];
+            instruction_pointer_set(regs, pc + 4);
+        } else {
+            /* 是怪物 -> 无敌处理，修复sp后返回 */
+            regs->sp += req->sp_add;
+            regs->regs[0] = req->val_1;
+            instruction_pointer_set(regs, regs->regs[30]);
         }
-        }
-        break; 
+    } else {
+        regs->regs[req->reg_idx_2] = 0;
+        instruction_pointer_set(regs, pc + 4);
     }
+    break;
+}
 }
 
 /* --- 透传底层硬件真实错误码 --- */
