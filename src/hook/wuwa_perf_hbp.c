@@ -151,13 +151,16 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
             uint32_t flag = 0;
             uint64_t tgt_addr = regs->regs[req->reg_idx_1] + req->offset;
 
+            /* ★ 唯一修改处：逻辑彻底反转！ */
             if (fn_nofault_read && fn_nofault_read(&flag, (void __user *)tgt_addr, 4) == 0 && flag == req->cmp_val) {
-                regs->regs[req->reg_idx_2] = regs->regs[req->reg_idx_1];
-                instruction_pointer_set(regs, pc + 4);
-            } else {
+                /* 满足条件（玩家）：触发无敌，修复堆栈并强行返回 */
                 regs->sp += req->sp_add;
                 regs->regs[0] = req->val_1;
                 instruction_pointer_set(regs, regs->regs[30]);
+            } else {
+                /* 不满足条件（怪物）：正常执行原有指令，继续走掉血流程 */
+                regs->regs[req->reg_idx_2] = regs->regs[req->reg_idx_1];
+                instruction_pointer_set(regs, pc + 4);
             }
             break;
         }
@@ -275,7 +278,6 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
             g_bps[g_bp_count++] = bp;
         } else {
             ret = bp_err;
-            /* 哪怕单个挂载失败（比如单个线程槽位满），我们也让已经挂上的继续运行，不退出 */
         }
     }
 
