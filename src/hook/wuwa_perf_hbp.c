@@ -153,13 +153,12 @@ static void restore_all_ptes(struct client_ctx *ctx) {
 }
 
 /* ==========================================================
- * Kprobe 异常捕获 (移至安全函数 do_page_fault)
+ * Kprobe 异常捕获
  * ========================================================== */
 static struct kprobe kp_pf;
 static struct kprobe kp_ss;
 
 static int pre_pf_handler(struct kprobe *p, struct pt_regs *regs) {
-    /* ARM64 do_page_fault(unsigned long far, unsigned int esr, struct pt_regs *regs) */
     unsigned int esr = regs->regs[1];
     struct pt_regs *fault_regs = (struct pt_regs *)regs->regs[2];
     uint64_t pc;
@@ -216,7 +215,6 @@ static int pre_pf_handler(struct kprobe *p, struct pt_regs *regs) {
 }
 
 static int pre_ss_handler(struct kprobe *p, struct pt_regs *regs) {
-    /* ARM64 single_step_handler(unsigned long addr, unsigned int esr, struct pt_regs *regs) */
     unsigned int esr = regs->regs[1];
     struct pt_regs *fault_regs = (struct pt_regs *)regs->regs[2];
     int i;
@@ -324,21 +322,36 @@ static struct miscdevice misc_dev = {
 
 int wuwa_hbp_init_device(void) {
     int ret;
+    unsigned long pf_addr, ss_addr;
+
+    /* [核心改动]：利用框架的无视黑名单查询机制，获取底层物理硬地址 */
+    pf_addr = kallsyms_lookup_name_ex("do_page_fault");
+    if (!pf_addr) {
+        pr_err("[stealth_engine] Cannot find hard address for do_page_fault\n");
+        return -ENOSYS;
+    }
     
-    kp_pf.symbol_name = "do_page_fault";
+    ss_addr = kallsyms_lookup_name_ex("single_step_handler");
+    if (!ss_addr) {
+        pr_err("[stealth_engine] Cannot find hard address for single_step_handler\n");
+        return -ENOSYS;
+    }
+
+    /* 直接赋予物理地址，废除 Kprobe 自带的无效符号查询机制 */
+    kp_pf.addr = (kprobe_opcode_t *)pf_addr;
     kp_pf.pre_handler = pre_pf_handler;
     ret = register_kprobe(&kp_pf);
     if (ret < 0) {
-        pr_err("[stealth_engine] Failed to register kp_pf: %d\n", ret);
-        return ret; /* 安全退出，拒绝加载，不引起内核崩溃 */
+        pr_err("[stealth_engine] Failed to force-register kp_pf: %d\n", ret);
+        return ret; 
     }
 
-    kp_ss.symbol_name = "single_step_handler";
+    kp_ss.addr = (kprobe_opcode_t *)ss_addr;
     kp_ss.pre_handler = pre_ss_handler;
     ret = register_kprobe(&kp_ss);
     if (ret < 0) {
         unregister_kprobe(&kp_pf);
-        pr_err("[stealth_engine] Failed to register kp_ss: %d\n", ret);
+        pr_err("[stealth_engine] Failed to force-register kp_ss: %d\n", ret);
         return ret;
     }
 
