@@ -1,6 +1,14 @@
 #include "wuwa_sock.h"
+
+#include <linux/version.h>
+#include <linux/net.h>
+#include <linux/poll.h>
+#include <linux/socket.h>
+#include <linux/sockptr.h>
+
 #include <asm/pgalloc.h>
 #include <asm/pgtable-hwdef.h>
+
 #include "wuwa_ioctl.h"
 #include "wuwa_protocol.h"
 #include "wuwa_utils.h"
@@ -42,13 +50,12 @@ static int wuwa_ioctl(struct socket* sock, unsigned int cmd,
                        unsigned long arg) {
     void __user* argp = (void __user*)arg;
 
-    /* 调试：打印收到的命令号 */
     pr_info("[wuwa] ioctl called cmd=%u\n", cmd);
 
     int i;
     for (i = 0; i < ARRAY_SIZE(ioctl_handlers); i++) {
         if (ioctl_handlers[i].cmd == 0)
-            break; /* 哨兵 */
+            break;
 
         if (cmd == ioctl_handlers[i].cmd) {
             if (ioctl_handlers[i].handler == NULL) {
@@ -132,7 +139,18 @@ static int wuwa_socketpair(struct socket* sock1, struct socket* sock2)
     return -EOPNOTSUPP;
 }
 
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0))
+/*
+ * Linux / Android GKI 6.12 changed proto_ops.accept signature:
+ *
+ * old:
+ *   int accept(struct socket *sock, struct socket *newsock,
+ *              int flags, bool kern);
+ *
+ * new:
+ *   int accept(struct socket *sock, struct socket *newsock,
+ *              struct proto_accept_arg *arg);
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 static int wuwa_accept(struct socket* sock, struct socket* newsock,
                         struct proto_accept_arg* arg)
 {
