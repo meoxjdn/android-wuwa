@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * wuwa_perf_hbp.c — 泛用硬件断点拦截模块 (原版逻辑 + 任意门/CF扩展)
+ * wuwa_universal_hbp.c — 终极通用硬件断点执行引擎 (免重编版)
  */
 
 #include <linux/perf_event.h>
@@ -21,27 +21,38 @@
 #define MAX_HOOKS 16
 #define MAX_BPS   2048   
 
-enum generic_action_type {
-    ACT_PC_SKIP            = 0,
-    ACT_PC_RET             = 1,
-    ACT_SET_REG_SKIP       = 2,
-    ACT_SET_REG_RET        = 3,
-    ACT_SET_FPREG_RET      = 4,
-    ACT_COND_MEM_READ_SKIP = 5,
-    ACT_SET_FPREG_SKIP     = 6,  /* CF 专属 */
-    ACT_PC_JUMP            = 7   /* 秒过任意门跳转 */
-};
+#define PC_BEHAVIOR_NONE  0
+#define PC_BEHAVIOR_SKIP  1  /* PC += 4 */
+#define PC_BEHAVIOR_RET   2  /* PC = LR */
+#define PC_BEHAVIOR_JUMP  3  /* PC = target_addr */
 
+#pragma pack(push, 8)
+/* ★ 通用载荷指令集 (由控制端下发) ★ */
 struct hook_request {
-    uint64_t vaddr;
-    uint32_t action;
-    uint32_t reg_idx_1;
-    uint32_t reg_idx_2;
-    uint64_t val_1;
-    uint64_t val_2;
-    uint32_t offset;
-    uint32_t cmp_val;
-    uint32_t sp_add;
+    uint64_t vaddr;             // 拦截的指令地址
+
+    /* 1. 常规修改指令 */
+    uint32_t modify_x_idx;      // 要修改的通用寄存器 (0-31, 0xFF表示不改)
+    uint64_t modify_x_val;      // 写入的值
+    uint32_t modify_s_idx;      // 要修改的浮点寄存器 (0-31, 0xFF表示不改)
+    uint32_t modify_s_val;      // 写入的浮点值 (HEX)
+    uint32_t add_sp_val;        // 堆栈补偿 (SP += X)
+    
+    /* 2. 控制流调度指令 */
+    uint32_t pc_behavior;       // 正常情况下的 PC 去向
+    uint64_t pc_jump_addr;      // 如果是 JUMP，目标地址
+
+    /* 3. 动态内存条件判定分支 (可选) */
+    uint32_t use_cond;          // 是否启用条件判断 (1=开启)
+    uint32_t cond_base_reg;     // 基址寄存器
+    uint32_t cond_offset;       // 偏移量
+    uint32_t cond_cmp_val;      // 对比值
+    
+    // 如果条件不匹配，执行以下备用逻辑 (如怪物强行重置)
+    uint32_t false_x0_modify;   // 是否强制修改返回值 X0 (1=是)
+    uint64_t false_x0_val;
+    uint32_t false_add_sp;      
+    uint32_t false_pc_behavior; 
 };
 
 struct wuwa_hbp_req {
@@ -50,13 +61,14 @@ struct wuwa_hbp_req {
     struct   hook_request hooks[MAX_HOOKS];
 };
 
-#define CMD_HBP_INSTALL 0x5A5A1001
-#define CMD_HBP_CLEANUP 0x5A5A1002
-
 struct core_cmd_packet {
     uint32_t cmd_id;
     uint64_t payload_ptr;
 };
+#pragma pack(pop)
+
+#define CMD_HBP_INSTALL 0x5A5A1001
+#define CMD_HBP_CLEANUP 0x5A5A1002
 
 struct hook_config {
     uint32_t count;
@@ -96,6 +108,16 @@ static int resolve_symbols_natively(void) {
     return 0;
 }
 
+static void apply_pc_behavior(struct pt_regs *regs, uint64_t current_pc, uint32_t behavior, uint64_t jump_addr) {
+    if (behavior == PC_BEHAVIOR_SKIP) {
+        instruction_pointer_set(regs, current_pc + 4);
+    } else if (behavior == PC_BEHAVIOR_RET) {
+        instruction_pointer_set(regs, regs->regs[30]);
+    } else if (behavior == PC_BEHAVIOR_JUMP) {
+        instruction_pointer_set(regs, jump_addr);
+    }
+}
+
 static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs) {
     struct hook_config *cfg;
     uint64_t pc;
@@ -111,74 +133,41 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
         struct hook_request *req = &cfg->hooks[i];
 
         if (pc != req->vaddr) continue;
-        if (req->reg_idx_1 >= 32 || req->reg_idx_2 >= 32) break;
 
-        switch (req->action) {
-        case ACT_PC_SKIP:
-            instruction_pointer_set(regs, pc + 4);
-            break;
-
-        case ACT_PC_RET:
-            instruction_pointer_set(regs, regs->regs[30]);
-            break;
-
-        case ACT_SET_REG_SKIP:
-            regs->regs[req->reg_idx_1] = req->val_1;
-            instruction_pointer_set(regs, pc + 4);
-            break;
-
-        case ACT_SET_REG_RET:
-            regs->regs[req->reg_idx_1] = req->val_1;
-            instruction_pointer_set(regs, regs->regs[30]);
-            break;
-
-        case ACT_SET_FPREG_RET:
-            if (fn_fpsimd_save && fn_fpsimd_load && bp->ctx && bp->ctx->task) {
-                struct task_struct *tsk = bp->ctx->task;
-                struct user_fpsimd_state *fp = &tsk->thread.uw.fpsimd_state;
-
-                fn_fpsimd_save(fp);
-                fp->vregs[req->reg_idx_1] = (fp->vregs[req->reg_idx_1] & ~((__uint128_t)0xFFFFFFFFULL)) | ((__uint128_t)(uint32_t)req->val_1);
-                fn_fpsimd_load(fp);
+        /* 分支 1: 处理条件判定逻辑 (如怪物阵营判定) */
+        if (req->use_cond) {
+            uint32_t mem_val = 0;
+            uint64_t tgt_addr = regs->regs[req->cond_base_reg] + req->cond_offset;
+            int read_ok = fn_nofault_read ? (fn_nofault_read(&mem_val, (void __user *)tgt_addr, 4) == 0) : 0;
+            
+            if (read_ok && mem_val != req->cond_cmp_val) {
+                /* 判定失败：执行备用惩罚/重置逻辑 */
+                regs->sp += req->false_add_sp;
+                if (req->false_x0_modify) regs->regs[0] = req->false_x0_val;
+                apply_pc_behavior(regs, pc, req->false_pc_behavior, 0);
+                break; // 结束处理
             }
-            instruction_pointer_set(regs, regs->regs[30]);
-            break;
-
-        case ACT_SET_FPREG_SKIP:
-            if (fn_fpsimd_save && fn_fpsimd_load && bp->ctx && bp->ctx->task) {
-                struct task_struct *tsk = bp->ctx->task;
-                struct user_fpsimd_state *fp = &tsk->thread.uw.fpsimd_state;
-
-                fn_fpsimd_save(fp);
-                fp->vregs[req->reg_idx_1] = (fp->vregs[req->reg_idx_1] & ~((__uint128_t)0xFFFFFFFFULL)) | ((__uint128_t)(uint32_t)req->val_1);
-                fn_fpsimd_load(fp);
-            }
-            instruction_pointer_set(regs, pc + 4);
-            break;
-
-        case ACT_PC_JUMP:
-            instruction_pointer_set(regs, req->val_1);
-            break;
-
-        case ACT_COND_MEM_READ_SKIP: {
-            uint32_t flag = 0;
-            uint64_t tgt_addr = regs->regs[req->reg_idx_1] + req->offset;
-
-            if (fn_nofault_read && fn_nofault_read(&flag, (void __user *)tgt_addr, 4) == 0) {
-                if (flag == req->cmp_val) {
-                    regs->regs[req->reg_idx_2] = regs->regs[req->reg_idx_1];
-                    instruction_pointer_set(regs, pc + 4);
-                } else {
-                    regs->sp += req->sp_add;
-                    regs->regs[0] = req->val_1; 
-                    instruction_pointer_set(regs, regs->regs[30]);
-                }
-            } else {
-                instruction_pointer_set(regs, pc + 4);
-            }
-            break;
         }
+
+        /* 分支 2: 执行通用修改载荷 */
+        if (req->modify_x_idx < 32) {
+            regs->regs[req->modify_x_idx] = req->modify_x_val;
         }
+
+        if (req->modify_s_idx < 32 && fn_fpsimd_save && fn_fpsimd_load && bp->ctx && bp->ctx->task) {
+            struct task_struct *tsk = bp->ctx->task;
+            struct user_fpsimd_state *fp = &tsk->thread.uw.fpsimd_state;
+            fn_fpsimd_save(fp);
+            fp->vregs[req->modify_s_idx] = (fp->vregs[req->modify_s_idx] & ~((__uint128_t)0xFFFFFFFFULL)) | ((__uint128_t)req->modify_s_val);
+            fn_fpsimd_load(fp);
+        }
+
+        if (req->add_sp_val > 0) {
+            regs->sp += req->add_sp_val;
+        }
+
+        /* 分支 3: 控制流结算 */
+        apply_pc_behavior(regs, pc, req->pc_behavior, req->pc_jump_addr);
         break; 
     }
 }
@@ -187,10 +176,7 @@ static struct perf_event *install_bp(struct task_struct *tsk, uint64_t addr, int
     struct perf_event_attr attr;
     struct perf_event     *bp;
 
-    if (!fn_register) {
-        if (out_err) *out_err = -ENOSYS;
-        return NULL;
-    }
+    if (!fn_register) { if (out_err) *out_err = -ENOSYS; return NULL; }
 
     hw_breakpoint_init(&attr);
     attr.bp_addr  = addr;
@@ -199,64 +185,40 @@ static struct perf_event *install_bp(struct task_struct *tsk, uint64_t addr, int
     attr.disabled = 0;
 
     bp = fn_register(&attr, wuwa_hbp_handler, NULL, tsk);
-    if (IS_ERR(bp)) {
-        if (out_err) *out_err = PTR_ERR(bp);
-        return NULL;
-    }
+    if (IS_ERR(bp)) { if (out_err) *out_err = PTR_ERR(bp); return NULL; }
     return bp;
 }
 
 void wuwa_cleanup_perf_hbp(void) {
     struct hook_config *old_cfg;
     int i;
-
     mutex_lock(&g_bp_mutex);
     old_cfg = rcu_dereference_protected(g_hook_config, lockdep_is_held(&g_bp_mutex));
     RCU_INIT_POINTER(g_hook_config, NULL);
-
     for (i = 0; i < g_bp_count; i++) {
-        if (g_bps[i] && fn_unregister) {
-            fn_unregister(g_bps[i]);
-            g_bps[i] = NULL;
-        }
+        if (g_bps[i] && fn_unregister) { fn_unregister(g_bps[i]); g_bps[i] = NULL; }
     }
     g_bp_count = 0;
     mutex_unlock(&g_bp_mutex);
-
-    if (old_cfg) {
-        synchronize_rcu();
-        kfree(old_cfg);
-    }
+    if (old_cfg) { synchronize_rcu(); kfree(old_cfg); }
 }
 
 int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
-    struct hook_config *new_cfg;
-    struct hook_config *old_cfg;
+    struct hook_config *new_cfg, *old_cfg;
     struct task_struct *tsk;
     struct pid         *pid_struct;
     uint32_t            hook_count;
     int                 i, ret = 0;
 
     if (!req) return -EINVAL;
-
     hook_count = req->hook_count > MAX_HOOKS ? MAX_HOOKS : req->hook_count;
-    for (i = 0; i < hook_count; i++) {
-        if (req->hooks[i].reg_idx_1 >= 32 || req->hooks[i].reg_idx_2 >= 32)
-            return -EINVAL;
-    }
-
     if (resolve_symbols_natively() != 0) return -ENOSYS;
 
     pid_struct = find_get_pid(req->tid);
     if (!pid_struct) return -ESRCH;
-
     rcu_read_lock();
     tsk = pid_task(pid_struct, PIDTYPE_PID);
-    if (!tsk) {
-        rcu_read_unlock();
-        put_pid(pid_struct);
-        return -ESRCH;
-    }
+    if (!tsk) { rcu_read_unlock(); put_pid(pid_struct); return -ESRCH; }
     get_task_struct(tsk);
     rcu_read_unlock();
 
@@ -264,86 +226,41 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     if (!new_cfg) { ret = -ENOMEM; goto out_task; }
 
     mutex_lock(&g_bp_mutex);
-
-    if (g_bp_count + hook_count > MAX_BPS) {
-        mutex_unlock(&g_bp_mutex);
-        kfree(new_cfg);
-        ret = -ENOSPC;
-        goto out_task;
-    }
-
+    if (g_bp_count + hook_count > MAX_BPS) { mutex_unlock(&g_bp_mutex); kfree(new_cfg); ret = -ENOSPC; goto out_task; }
     old_cfg = rcu_dereference_protected(g_hook_config, lockdep_is_held(&g_bp_mutex));
 
     new_cfg->count = hook_count;
-    for (i = 0; i < hook_count; i++) {
-        new_cfg->hooks[i] = req->hooks[i];
-    }
-
+    for (i = 0; i < hook_count; i++) new_cfg->hooks[i] = req->hooks[i];
     rcu_assign_pointer(g_hook_config, new_cfg);
 
     for (i = 0; i < hook_count; i++) {
         int bp_err = 0;
         struct perf_event *bp = install_bp(tsk, req->hooks[i].vaddr, &bp_err);
-        if (bp) {
-            g_bps[g_bp_count++] = bp;
-        } else {
-            ret = bp_err;
-        }
+        if (bp) g_bps[g_bp_count++] = bp; else ret = bp_err;
     }
-
     mutex_unlock(&g_bp_mutex);
-
-    if (old_cfg) {
-        synchronize_rcu();
-        kfree(old_cfg);
-    }
+    if (old_cfg) { synchronize_rcu(); kfree(old_cfg); }
 
 out_task:
-    put_task_struct(tsk);
-    put_pid(pid_struct);
+    put_task_struct(tsk); put_pid(pid_struct);
     return ret;
 }
 
 static ssize_t core_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos) {
     struct core_cmd_packet pkt;
     struct wuwa_hbp_req    req;
-    int err;
-
     if (count != sizeof(pkt)) return -EINVAL;
     if (copy_from_user(&pkt, buf, sizeof(pkt))) return -EFAULT;
-
     if (pkt.cmd_id == CMD_HBP_INSTALL) {
-        if (copy_from_user(&req, (void __user *)pkt.payload_ptr, sizeof(req)))
-            return -EFAULT;
-        
-        err = wuwa_install_perf_hbp(&req);
-        if (err < 0) return err;
-        return count; 
-        
+        if (copy_from_user(&req, (void __user *)pkt.payload_ptr, sizeof(req))) return -EFAULT;
+        return wuwa_install_perf_hbp(&req) < 0 ? -EFAULT : count;
     } else if (pkt.cmd_id == CMD_HBP_CLEANUP) {
-        wuwa_cleanup_perf_hbp();
-        return count;
+        wuwa_cleanup_perf_hbp(); return count;
     } 
-
     return -EINVAL;
 }
 
-static const struct file_operations core_fops = {
-    .owner = THIS_MODULE,
-    .write = core_write,
-};
-
-static struct miscdevice core_misc = {
-    .minor = MISC_DYNAMIC_MINOR,
-    .name  = DEV_NAME,
-    .fops  = &core_fops,
-};
-
-int wuwa_hbp_init_device(void) {
-    return misc_register(&core_misc);
-}
-
-void wuwa_hbp_cleanup_device(void) {
-    wuwa_cleanup_perf_hbp();
-    misc_deregister(&core_misc);
-}
+static const struct file_operations core_fops = { .owner = THIS_MODULE, .write = core_write };
+static struct miscdevice core_misc = { .minor = MISC_DYNAMIC_MINOR, .name = DEV_NAME, .fops = &core_fops };
+int wuwa_hbp_init_device(void) { return misc_register(&core_misc); }
+void wuwa_hbp_cleanup_device(void) { wuwa_cleanup_perf_hbp(); misc_deregister(&core_misc); }
