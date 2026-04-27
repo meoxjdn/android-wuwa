@@ -42,7 +42,10 @@ jobs:
         mkdir -p /github/workspace/out
         
         # Copy with KMI-specific naming
-        OUTPUT_NAME="${{ inputs.module_name }}-${{ inputs.kmi }}.ko"
+        # 提取 5.10 / 6.1
+KVER=$(echo "${{ inputs.kmi }}" | awk -F'-' '{print $2}')
+
+OUTPUT_NAME="${KVER}.ko"
         cp "${{ inputs.module_name }}.ko" "/github/workspace/out/$OUTPUT_NAME"
 
         echo "Copied to: /github/workspace/out/$OUTPUT_NAME"
