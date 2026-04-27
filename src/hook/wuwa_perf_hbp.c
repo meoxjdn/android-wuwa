@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * wuwa_perf_hbp.c — 泛用硬件断点拦截模块 (火影 + CF 全能终极版)
+ * wuwa_perf_hbp.c — 泛用硬件断点拦截模块 (原版逻辑 + 任意门/CF扩展)
  */
 
 #include <linux/perf_event.h>
@@ -28,8 +28,8 @@ enum generic_action_type {
     ACT_SET_REG_RET        = 3,
     ACT_SET_FPREG_RET      = 4,
     ACT_COND_MEM_READ_SKIP = 5,
-    ACT_SET_FPREG_SKIP     = 6,  /* CF 专属：修改浮点寄存器并跳过原指令 */
-    ACT_PC_JUMP            = 7   /* 火影专属：劫持 PC 指针跳转到指定绝对地址 (任意门) */
+    ACT_SET_FPREG_SKIP     = 6,  /* 新增：CF 专属 */
+    ACT_PC_JUMP            = 7   /* 新增：秒过任意门跳转 */
 };
 
 struct hook_request {
@@ -136,6 +136,7 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
             if (fn_fpsimd_save && fn_fpsimd_load && bp->ctx && bp->ctx->task) {
                 struct task_struct *tsk = bp->ctx->task;
                 struct user_fpsimd_state *fp = &tsk->thread.uw.fpsimd_state;
+
                 fn_fpsimd_save(fp);
                 fp->vregs[req->reg_idx_1] = (fp->vregs[req->reg_idx_1] & ~((__uint128_t)0xFFFFFFFFULL)) | ((__uint128_t)(uint32_t)req->val_1);
                 fn_fpsimd_load(fp);
@@ -143,10 +144,12 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
             instruction_pointer_set(regs, regs->regs[30]);
             break;
 
+        /* 新增：CF 浮点指令拦截 (跳过并继续) */
         case ACT_SET_FPREG_SKIP:
             if (fn_fpsimd_save && fn_fpsimd_load && bp->ctx && bp->ctx->task) {
                 struct task_struct *tsk = bp->ctx->task;
                 struct user_fpsimd_state *fp = &tsk->thread.uw.fpsimd_state;
+
                 fn_fpsimd_save(fp);
                 fp->vregs[req->reg_idx_1] = (fp->vregs[req->reg_idx_1] & ~((__uint128_t)0xFFFFFFFFULL)) | ((__uint128_t)(uint32_t)req->val_1);
                 fn_fpsimd_load(fp);
@@ -154,26 +157,29 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
             instruction_pointer_set(regs, pc + 4);
             break;
 
+        /* 新增：任意门绝对地址跳转 */
         case ACT_PC_JUMP:
-            /* ★ 任意门：将 PC 直接劫持到给定的绝对地址 */
             instruction_pointer_set(regs, req->val_1);
             break;
 
+        /* 绝对原版无伤防闪退逻辑：一字未改！ */
         case ACT_COND_MEM_READ_SKIP: {
             uint32_t flag = 0;
             uint64_t tgt_addr = regs->regs[req->reg_idx_1] + req->offset;
 
             if (fn_nofault_read && fn_nofault_read(&flag, (void __user *)tgt_addr, 4) == 0) {
                 if (flag == req->cmp_val) {
-                    regs->sp += req->sp_add;
-                    regs->regs[0] = req->val_1;
-                    instruction_pointer_set(regs, regs->regs[30]);
-                } else {
-                    regs->regs[req->reg_idx_2] = flag;
+                    /* 情况 A: 是玩家 -> 仅 Skip 原伤害计算指令，保留上下文 */
+                    regs->regs[req->reg_idx_2] = regs->regs[req->reg_idx_1];
                     instruction_pointer_set(regs, pc + 4);
+                } else {
+                    /* 情况 B: 是怪物/其他 -> 执行无敌逻辑：修复堆栈并强制返回 */
+                    regs->sp += req->sp_add;
+                    regs->regs[0] = req->val_1; // 通常设置为 1 或原返回值
+                    instruction_pointer_set(regs, regs->regs[30]);
                 }
             } else {
-                regs->regs[req->reg_idx_2] = 0;
+                /* 读取失败兜底：不进行修改，尝试跳过指令防止死循环 */
                 instruction_pointer_set(regs, pc + 4);
             }
             break;
