@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * wuwa_perf_hbp.c — 泛用硬件断点拦截模块 (原版逻辑 + 任意门/CF扩展)
+ * wuwa_perf_hbp.c — 泛用硬件断点拦截模块 (静态全屏集成版)
  */
 
 #include <linux/perf_event.h>
@@ -28,8 +28,8 @@ enum generic_action_type {
     ACT_SET_REG_RET        = 3,
     ACT_SET_FPREG_RET      = 4,
     ACT_COND_MEM_READ_SKIP = 5,
-    ACT_SET_FPREG_SKIP     = 6,  /* 新增：CF 专属 */
-    ACT_PC_JUMP            = 7   /* 新增：秒过任意门跳转 */
+    ACT_SET_FPREG_SKIP     = 6,
+    ACT_PC_JUMP            = 7
 };
 
 struct hook_request {
@@ -111,6 +111,10 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
         struct hook_request *req = &cfg->hooks[i];
 
         if (pc != req->vaddr) continue;
+        
+        // 诊断日志：通过 dmesg 确认断点是否真的命中了
+        pr_info("[HBP_LOG] Triggered at 0x%llx in TID: %d\n", req->vaddr, current->pid);
+
         if (req->reg_idx_1 >= 32 || req->reg_idx_2 >= 32) break;
 
         switch (req->action) {
@@ -133,18 +137,6 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
             break;
 
         case ACT_SET_FPREG_RET:
-            if (fn_fpsimd_save && fn_fpsimd_load && bp->ctx && bp->ctx->task) {
-                struct task_struct *tsk = bp->ctx->task;
-                struct user_fpsimd_state *fp = &tsk->thread.uw.fpsimd_state;
-
-                fn_fpsimd_save(fp);
-                fp->vregs[req->reg_idx_1] = (fp->vregs[req->reg_idx_1] & ~((__uint128_t)0xFFFFFFFFULL)) | ((__uint128_t)(uint32_t)req->val_1);
-                fn_fpsimd_load(fp);
-            }
-            instruction_pointer_set(regs, regs->regs[30]);
-            break;
-
-        /* 新增：CF 浮点指令拦截 (跳过并继续) */
         case ACT_SET_FPREG_SKIP:
             if (fn_fpsimd_save && fn_fpsimd_load && bp->ctx && bp->ctx->task) {
                 struct task_struct *tsk = bp->ctx->task;
@@ -154,32 +146,30 @@ static void wuwa_hbp_handler(struct perf_event *bp, struct perf_sample_data *dat
                 fp->vregs[req->reg_idx_1] = (fp->vregs[req->reg_idx_1] & ~((__uint128_t)0xFFFFFFFFULL)) | ((__uint128_t)(uint32_t)req->val_1);
                 fn_fpsimd_load(fp);
             }
-            instruction_pointer_set(regs, pc + 4);
+            if (req->action == ACT_SET_FPREG_RET)
+                instruction_pointer_set(regs, regs->regs[30]);
+            else
+                instruction_pointer_set(regs, pc + 4);
             break;
 
-        /* 新增：任意门绝对地址跳转 */
         case ACT_PC_JUMP:
             instruction_pointer_set(regs, req->val_1);
             break;
 
-        /* 绝对原版无伤防闪退逻辑：一字未改！ */
         case ACT_COND_MEM_READ_SKIP: {
             uint32_t flag = 0;
             uint64_t tgt_addr = regs->regs[req->reg_idx_1] + req->offset;
 
             if (fn_nofault_read && fn_nofault_read(&flag, (void __user *)tgt_addr, 4) == 0) {
                 if (flag == req->cmp_val) {
-                    /* 情况 A: 是玩家 -> 仅 Skip 原伤害计算指令，保留上下文 */
                     regs->regs[req->reg_idx_2] = regs->regs[req->reg_idx_1];
                     instruction_pointer_set(regs, pc + 4);
                 } else {
-                    /* 情况 B: 是怪物/其他 -> 执行无敌逻辑：修复堆栈并强制返回 */
                     regs->sp += req->sp_add;
-                    regs->regs[0] = req->val_1; // 通常设置为 1 或原返回值
+                    regs->regs[0] = req->val_1;
                     instruction_pointer_set(regs, regs->regs[30]);
                 }
             } else {
-                /* 读取失败兜底：不进行修改，尝试跳过指令防止死循环 */
                 instruction_pointer_set(regs, pc + 4);
             }
             break;
@@ -215,11 +205,9 @@ static struct perf_event *install_bp(struct task_struct *tsk, uint64_t addr, int
 void wuwa_cleanup_perf_hbp(void) {
     struct hook_config *old_cfg;
     int i;
-
     mutex_lock(&g_bp_mutex);
     old_cfg = rcu_dereference_protected(g_hook_config, lockdep_is_held(&g_bp_mutex));
     RCU_INIT_POINTER(g_hook_config, NULL);
-
     for (i = 0; i < g_bp_count; i++) {
         if (g_bps[i] && fn_unregister) {
             fn_unregister(g_bps[i]);
@@ -228,7 +216,6 @@ void wuwa_cleanup_perf_hbp(void) {
     }
     g_bp_count = 0;
     mutex_unlock(&g_bp_mutex);
-
     if (old_cfg) {
         synchronize_rcu();
         kfree(old_cfg);
@@ -244,18 +231,14 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     int                 i, ret = 0;
 
     if (!req) return -EINVAL;
-
     hook_count = req->hook_count > MAX_HOOKS ? MAX_HOOKS : req->hook_count;
     for (i = 0; i < hook_count; i++) {
         if (req->hooks[i].reg_idx_1 >= 32 || req->hooks[i].reg_idx_2 >= 32)
             return -EINVAL;
     }
-
     if (resolve_symbols_natively() != 0) return -ENOSYS;
-
     pid_struct = find_get_pid(req->tid);
     if (!pid_struct) return -ESRCH;
-
     rcu_read_lock();
     tsk = pid_task(pid_struct, PIDTYPE_PID);
     if (!tsk) {
@@ -265,28 +248,21 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     }
     get_task_struct(tsk);
     rcu_read_unlock();
-
     new_cfg = kzalloc(sizeof(*new_cfg), GFP_KERNEL);
     if (!new_cfg) { ret = -ENOMEM; goto out_task; }
-
     mutex_lock(&g_bp_mutex);
-
     if (g_bp_count + hook_count > MAX_BPS) {
         mutex_unlock(&g_bp_mutex);
         kfree(new_cfg);
         ret = -ENOSPC;
         goto out_task;
     }
-
     old_cfg = rcu_dereference_protected(g_hook_config, lockdep_is_held(&g_bp_mutex));
-
     new_cfg->count = hook_count;
     for (i = 0; i < hook_count; i++) {
         new_cfg->hooks[i] = req->hooks[i];
     }
-
     rcu_assign_pointer(g_hook_config, new_cfg);
-
     for (i = 0; i < hook_count; i++) {
         int bp_err = 0;
         struct perf_event *bp = install_bp(tsk, req->hooks[i].vaddr, &bp_err);
@@ -296,14 +272,11 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
             ret = bp_err;
         }
     }
-
     mutex_unlock(&g_bp_mutex);
-
     if (old_cfg) {
         synchronize_rcu();
         kfree(old_cfg);
     }
-
 out_task:
     put_task_struct(tsk);
     put_pid(pid_struct);
@@ -314,42 +287,22 @@ static ssize_t core_write(struct file *file, const char __user *buf, size_t coun
     struct core_cmd_packet pkt;
     struct wuwa_hbp_req    req;
     int err;
-
     if (count != sizeof(pkt)) return -EINVAL;
     if (copy_from_user(&pkt, buf, sizeof(pkt))) return -EFAULT;
-
     if (pkt.cmd_id == CMD_HBP_INSTALL) {
         if (copy_from_user(&req, (void __user *)pkt.payload_ptr, sizeof(req)))
             return -EFAULT;
-        
         err = wuwa_install_perf_hbp(&req);
         if (err < 0) return err;
         return count; 
-        
     } else if (pkt.cmd_id == CMD_HBP_CLEANUP) {
         wuwa_cleanup_perf_hbp();
         return count;
     } 
-
     return -EINVAL;
 }
 
-static const struct file_operations core_fops = {
-    .owner = THIS_MODULE,
-    .write = core_write,
-};
-
-static struct miscdevice core_misc = {
-    .minor = MISC_DYNAMIC_MINOR,
-    .name  = DEV_NAME,
-    .fops  = &core_fops,
-};
-
-int wuwa_hbp_init_device(void) {
-    return misc_register(&core_misc);
-}
-
-void wuwa_hbp_cleanup_device(void) {
-    wuwa_cleanup_perf_hbp();
-    misc_deregister(&core_misc);
-}
+static const struct file_operations core_fops = { .owner = THIS_MODULE, .write = core_write };
+static struct miscdevice core_misc = { .minor = MISC_DYNAMIC_MINOR, .name = DEV_NAME, .fops = &core_fops };
+int wuwa_hbp_init_device(void) { return misc_register(&core_misc); }
+void wuwa_hbp_cleanup_device(void) { wuwa_cleanup_perf_hbp(); misc_deregister(&core_misc); }
