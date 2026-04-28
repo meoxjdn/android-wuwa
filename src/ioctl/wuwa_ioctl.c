@@ -17,7 +17,7 @@
 
 #include "wuwa_proc.h"
 #include "wuwa_safe_signal.h"
-#include "../hook/wuwa_perf_hbp.h" /* 包含 PTE SOTA 引擎头文件 */
+#include "../hook/wuwa_perf_hbp.h"
 
 int do_vaddr_translate(struct socket* sock, void* arg) {
     struct wuwa_addr_translate_cmd cmd;
@@ -825,21 +825,31 @@ int do_get_process_info(struct socket* sock, void __user* arg) {
 }
 
 /* ================================================================
- * PTE UXN Stealth 引擎控制接口处理函数
+ * Perf HBP 内核硬件断点通信处理函数 (V18 影子内存改造版)
  * ================================================================ */
-int do_set_stealth(struct socket* sock, void __user* arg) {
-    struct wuwa_stealth_req req;
+int do_set_perf_hbp(struct socket* sock, void __user* arg) {
+    struct wuwa_hbp_req req;
 
     if (copy_from_user(&req, arg, sizeof(req))) {
-        wuwa_err("[Stealth] copy_from_user failed\n");
+        wuwa_err("copy_from_user failed in do_set_perf_hbp\n");
         return -EFAULT;
     }
-    
-    wuwa_info("[Stealth] Installing PTE Trap for PID: %d, Hooks: %d\n", req.pid, req.hook_count);
-    return wuwa_install_stealth(&req);
+
+    /* 直接路由给影子补丁引擎 */
+    return wuwa_install_perf_hbp(&req);
 }
 
-int do_clean_stealth(struct socket* sock, void __user* arg) {
-    wuwa_cleanup_stealth();
-    return 0;
+/* 新增诊断接口：安全查询 Slot 状态 */
+int do_diag_shadow(struct socket* sock, void __user* arg) {
+    struct wuwa_diag_req req;
+
+    if (copy_from_user(&req, arg, sizeof(req))) {
+        return -EFAULT;
+    }
+
+    if (wuwa_diag_shadow_slot(&req) == 0) {
+        return copy_to_user(arg, &req, sizeof(req)) ? -EFAULT : 0;
+    }
+
+    return -ENOENT;
 }
