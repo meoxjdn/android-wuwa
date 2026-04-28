@@ -250,9 +250,10 @@ err_rollback:
 }
 
 /* ==========================================================
- * 4. V18 独立字符设备接口 (彻底绕过 Android 15 Socket 限制)
+ * 4. V18 专属 Proc 接口 (彻底绕过 Android /dev 生成拦截)
  * ========================================================== */
-#define DEV_NAME "logd_service"
+#include <linux/proc_fs.h>
+
 #define V18_IOCTL_CMD 0x5A5A9999
 
 static long wuwa_v18_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
@@ -265,30 +266,33 @@ static long wuwa_v18_ioctl(struct file *file, unsigned int cmd, unsigned long ar
     return -ENOTTY;
 }
 
-static const struct file_operations core_fops = {
+/* 兼容内核 6.6 的 proc_ops 结构 */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
+static const struct proc_ops v18_fops = {
+    .proc_ioctl = wuwa_v18_ioctl,
+    .proc_compat_ioctl = wuwa_v18_ioctl,
+};
+#else
+static const struct file_operations v18_fops = {
     .owner = THIS_MODULE,
     .unlocked_ioctl = wuwa_v18_ioctl,
     .compat_ioctl   = wuwa_v18_ioctl,
 };
+#endif
 
-static struct miscdevice core_misc = {
-    .minor = MISC_DYNAMIC_MINOR,
-    .name  = DEV_NAME,
-    .fops  = &core_fops,
-};
+static struct proc_dir_entry *wuwa_proc_entry = NULL;
 
-int wuwa_hbp_init_device(void) {
-    return misc_register(&core_misc);
+int wuwa_stealth_init(void) {
+    /* 直接在内核领地秒建 /proc/wuwa_v18，无人能挡 */
+    wuwa_proc_entry = proc_create("wuwa_v18", 0666, NULL, &v18_fops);
+    return wuwa_proc_entry ? 0 : -ENOMEM;
 }
 
-void wuwa_hbp_cleanup_device(void) {
-    misc_deregister(&core_misc);
+void wuwa_stealth_cleanup(void) {
+    if (wuwa_proc_entry) proc_remove(wuwa_proc_entry);
 }
 
+/* 兼容占位 */
+int wuwa_hbp_init_device(void) { return 0; }
+void wuwa_hbp_cleanup_device(void) { }
 void wuwa_cleanup_perf_hbp(void) { }
-
-/* ==========================================================
- * 5. 填补漏编模块的符号占位
- * ========================================================== */
-int wuwa_stealth_init(void) { return 0; }
-void wuwa_stealth_cleanup(void) { }
