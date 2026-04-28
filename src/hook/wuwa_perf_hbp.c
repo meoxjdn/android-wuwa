@@ -1,281 +1,260 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * wuwa_perf_hbp.c — PTE UXN 引擎 (浴火重生版 - 修复编译缺失)
- * 架构：Kprobe 哑弹劫持 + AOT 预编译跳板 + 裸写 PTE
+ * wuwa_perf_hbp.c — V18 事务级静态影子内存引擎 (终极点火版)
  */
 
-#include <linux/kprobes.h>
-#include <linux/sched.h>
 #include <linux/mm.h>
-#include <linux/uaccess.h>
+#include <linux/mmu_notifier.h>
+#include <linux/xarray.h>
+#include <linux/pagemap.h>
 #include <linux/slab.h>
-#include <linux/mmu_context.h>
+#include <linux/sched.h>
+#include <linux/pid.h>
+#include <linux/uaccess.h>
 #include <asm/pgtable.h>
 #include <asm/tlbflush.h>
-#include <asm/ptrace.h>
-#include <asm/esr.h>
-
-#include "../core/wuwa_common.h"
+#include <asm/cacheflush.h>
 #include "wuwa_perf_hbp.h"
-#include "../utils/wuwa_utils.h"
+#include "../core/wuwa_common.h"
 
-#define PTE_UXN_BIT   (1ULL << 54)
-#define BRK_MAGIC_IMM 0x1337
-/* 补全缺失的 BRK 指令机器码构造宏 */
-#define BRK_MAGIC_INST (0xD4200000 | (BRK_MAGIC_IMM << 5))
-#define OOL_SLOT_SIZE 64
+extern pmd_t *wuwa_walk_to_pmd(struct mm_struct *mm, unsigned long va);
 
-/* 全局配置 (由于只有一个目标游戏，精简为读写锁保护即可) */
-static struct wuwa_stealth_req g_current_req;
-static DEFINE_RWLOCK(g_engine_lock);
+struct shadow_slot {
+    unsigned long va;
+    struct page *orig_page;
+    struct page *shadow_page;
+    struct mm_struct *mm;
+    struct mmu_notifier notifier;
+    pte_t old_pte;
+    refcount_t refs;
+    atomic_t state; /* 1: ACTIVE, 0: DYING */
+    struct rcu_head rcu;
+};
 
-static struct kprobe kp_mem_abort;
-static struct kprobe kp_brk_handler;
+static DEFINE_XARRAY(g_shadow_xa);
 
-/* 动态解析的安全读内存函数 */
-static long (*fn_copy_from_user_nofault)(void *dst, const void __user *src, size_t size) = NULL;
-
-/* ==========================================
- * Kprobe 哑弹函数 (Dummy Function)
- * 核心黑科技：用于欺骗内核异常分发状态机
- * ========================================== */
-static void dummy_mem_abort(void) 
-{
-    /* 什么都不做，瞬间返回。
-     * 此时内核会以为 do_mem_abort 已执行完毕，直接触发原生的 ERET 返回用户态。
-     */
+/* ==========================================================
+ * 1. 资源管理与生命周期闭环
+ * ========================================================== */
+static void shadow_slot_free_rcu(struct rcu_head *head) {
+    struct shadow_slot *slot = container_of(head, struct shadow_slot, rcu);
+    if (slot->orig_page) put_page(slot->orig_page);
+    if (slot->shadow_page) put_page(slot->shadow_page);
+    kfree(slot);
 }
 
-/* ==========================================
- * PTE 强暴修改模块 (绕过 GKI 限制)
- * ========================================== */
-static int modify_page_uxn_baremetal(struct task_struct *tsk, unsigned long vaddr, bool set_uxn)
-{
-    struct mm_struct *mm;
-    pgd_t *pgd; p4d_t *p4d; pud_t *pud; pmd_t *pmd; pte_t *pte;
+static void slot_put(struct shadow_slot *slot) {
+    if (refcount_dec_and_test(&slot->refs))
+        call_rcu(&slot->rcu, shadow_slot_free_rcu);
+}
+
+static void shadow_mn_release(struct mmu_notifier *mn, struct mm_struct *mm) {
+    struct shadow_slot *slot = container_of(mn, struct shadow_slot, notifier);
+    if (atomic_xchg(&slot->state, 0) == 1) {
+        xa_erase(&g_shadow_xa, (unsigned long)mm ^ slot->va);
+        slot_put(slot);
+    }
+}
+
+static const struct mmu_notifier_ops shadow_ops = { .release = shadow_mn_release };
+
+/* ==========================================================
+ * 2. 连续页表 (ContPTE) 安全拆分
+ * ========================================================== */
+static int unfold_cont_group(struct mm_struct *mm, unsigned long addr, pmd_t *pmdp) {
+    unsigned long start = addr & ~(PAGE_SIZE * 16 - 1);
+    pte_t *ptep;
     spinlock_t *ptl;
-    pte_t old_pte, new_pte;
-    unsigned long tlbi_addr;
-    int ret = 0;
+    int i;
 
-    mm = get_task_mm(tsk);
-    if (!mm) return -ESRCH;
-
-    mmap_read_lock(mm);
-    pgd = pgd_offset(mm, vaddr);
-    if (pgd_none(*pgd) || pgd_bad(*pgd)) { ret = -EFAULT; goto out; }
-    p4d = p4d_offset(pgd, vaddr);
-    if (p4d_none(*p4d) || p4d_bad(*p4d)) { ret = -EFAULT; goto out; }
-    pud = pud_offset(p4d, vaddr);
-    if (pud_none(*pud) || pud_bad(*pud)) { ret = -EFAULT; goto out; }
-    pmd = pmd_offset(pud, vaddr);
-    if (pmd_none(*pmd) || pmd_bad(*pmd)) { ret = -EFAULT; goto out; }
+    ptep = pte_offset_map_lock(mm, pmdp, start, &ptl);
+    if (!ptep) return -EFAULT;
     
-    pte = pte_offset_map_lock(mm, pmd, vaddr, &ptl);
-    if (!pte) { ret = -EFAULT; goto out; }
+    for (i = 0; i < 16; i++) {
+        if (pte_val(ptep[i]) & (1ULL << 52)) {
+            pte_t pte = ptep_get_and_clear(mm, start + (i * PAGE_SIZE), &ptep[i]);
+            set_pte_at(mm, start + (i * PAGE_SIZE), &ptep[i], __pte(pte_val(pte) & ~(1ULL << 52)));
+        }
+    }
+    pte_unmap_unlock(ptep, ptl);
+    flush_tlb_mm_range(mm, start, start + (PAGE_SIZE * 16), PAGE_SHIFT, false);
+    return 0;
+}
 
-    old_pte = *pte;
-    new_pte = set_uxn ? __pte(pte_val(old_pte) | PTE_UXN_BIT) : __pte(pte_val(old_pte) & ~PTE_UXN_BIT);
-    
-    /* 裸写物理内存，无视 MTE/ContPTE */
-    WRITE_ONCE(*((u64 *)pte), pte_val(new_pte));
-    pte_unmap_unlock(pte, ptl);
+/* ==========================================================
+ * 3. 诊断查询 IOCTL：按需诊断，避免 VFS Hook 复杂度
+ * ========================================================== */
+int wuwa_diag_shadow_slot(struct wuwa_diag_req *req) {
+    struct shadow_slot *slot;
+    unsigned long key = (unsigned long)current->mm ^ req->va;
+    int ret = -ENOENT;
 
-    /* 纯汇编硬刷 TLB */
-    tlbi_addr = vaddr >> 12;
-    asm volatile("dsb ishst");
-    asm volatile("tlbi vae1is, %0" : : "r"(tlbi_addr));
-    asm volatile("dsb ish");
-    asm volatile("isb");
-
-out:
-    mmap_read_unlock(mm);
-    mmput(mm);
+    rcu_read_lock();
+    slot = xa_load(&g_shadow_xa, key);
+    if (slot && atomic_read(&slot->state) == 1) {
+        if (refcount_inc_not_zero(&slot->refs)) {
+            if (atomic_read(&slot->state) == 1) {
+                size_t off = req->va & ~PAGE_MASK;
+                u8 *k_shadow = kmap_local_page(slot->shadow_page);
+                req->current_inst = *(uint32_t *)(k_shadow + off);
+                req->ref_count = refcount_read(&slot->refs);
+                req->state = 1;
+                kunmap_local(k_shadow);
+                ret = 0;
+            }
+            slot_put(slot);
+        }
+    }
+    rcu_read_unlock();
     return ret;
 }
 
-/* ==========================================
- * 极简热路径路由 (O(N) 查表，因为 N 极小，速度极快)
- * ========================================== */
-static int pre_do_mem_abort(struct kprobe *p, struct pt_regs *kprobe_regs)
-{
-    unsigned int esr = kprobe_regs->regs[1]; 
-    struct pt_regs *user_regs = (struct pt_regs *)kprobe_regs->regs[2];
-    int ec = ESR_ELx_EC(esr);
-    int i;
-    unsigned long fault_pc;
+/* ==========================================================
+ * 4. 核心安装引擎：全路径失败回滚 + PTE 语义克隆
+ * ========================================================== */
+int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
+    struct pid *pid_s = find_get_pid(req->tid);
+    struct task_struct *tsk;
+    struct mm_struct *mm;
+    int i, ret = 0;
 
-    if (unlikely(ec != 0x20 && ec != 0x21)) return 0;
-    if (unlikely(!user_regs || current->tgid != g_current_req.pid)) return 0;
+    if (!pid_s) return -ESRCH;
+    tsk = get_pid_task(pid_s, PIDTYPE_PID);
+    if (!tsk) { put_pid(pid_s); return -ESRCH; }
+    mm = get_task_mm(tsk);
+    if (!mm) { put_task_struct(tsk); put_pid(pid_s); return -ESRCH; }
 
-    fault_pc = user_regs->pc;
+    for (i = 0; i < req->hook_count; i++) {
+        struct shadow_patch_req *preq = &req->hooks[i];
+        unsigned long va = req->base_addr + preq->offset;
+        struct shadow_slot *slot = NULL;
+        struct page *old_p = NULL, *new_p = NULL;
+        pte_t *ptep, old_pte;
+        spinlock_t *ptl;
+        bool pte_applied = false;
+        size_t off = va & ~PAGE_MASK;
 
-    read_lock(&g_engine_lock);
-    for (i = 0; i < g_current_req.hook_count; i++) {
-        struct hook_request *req = &g_current_req.hooks[i];
+        /* 1. 安检：边界与 4 字节指令对齐 */
+        if ((va & 3) || (off + 4 > PAGE_SIZE)) {
+            wuwa_err("Alignment or boundary check failed for 0x%lx\n", va);
+            continue;
+        }
+
+        /* 2. 物理准备：强制 COW 获取原始页 */
+        if (get_user_pages_remote(mm, va, 1, FOLL_WRITE | FOLL_FORCE, &old_p, NULL, NULL) <= 0) continue;
+        new_p = alloc_page(GFP_HIGHUSER);
+        if (!new_p) { put_page(old_p); continue; }
+
+        /* 3. 保险丝：预期原始指令比对 */
+        u8 *src_k = kmap_local_page(old_p);
+        if (*(uint32_t *)(src_k + off) != preq->expected) {
+            wuwa_err("Verify mismatch at 0x%lx: exp %08x, got %08x\n", va, preq->expected, *(uint32_t *)(src_k + off));
+            kunmap_local(src_k); put_page(old_p); __free_page(new_p);
+            continue;
+        }
+
+        /* 4. 打入补丁与缓存刷新 */
+        u8 *dst_k = kmap_local_page(new_p);
+        memcpy(dst_k, src_k, PAGE_SIZE);
+
+        switch (preq->action) {
+            case SHADOW_DATA_PATCH:
+                *(uint32_t *)(dst_k + off) = preq->patch_val; break;
+            case SHADOW_RET_ONLY:
+                *(uint32_t *)(dst_k + off) = 0xD65F03C0; break;
+            case SHADOW_HP_SET:
+                ((uint32_t *)(dst_k + off))[0] = 0x52800020; 
+                ((uint32_t *)(dst_k + off))[1] = 0xD65F03C0; break;
+            case SHADOW_JUMP_B: {
+                long j_off = (long)preq->target_va - (long)va;
+                *(uint32_t *)(dst_k + off) = 0x14000000 | ((j_off >> 2) & 0x03FFFFFF);
+                break;
+            }
+            case SHADOW_STUB_IF: {
+                uint32_t *stub = (uint32_t *)(dst_k + 0xF00);
+                unsigned long stub_va = (va & PAGE_MASK) + 0xF00;
+                stub[0] = 0xB9401C22; // ldr w2, [x1, #0x1c]
+                stub[1] = 0x7100045F; // cmp w2, #1
+                stub[2] = 0x54000040; // b.eq (.is_invincible)
+                stub[3] = preq->expected; 
+                stub[4] = 0x14000000 | (((long)va + 4 - (long)stub_va - 16) >> 2 & 0x03FFFFFF); // ret origin
+                stub[5] = 0xD65F03C0; // ret (.is_invincible)
+                *(uint32_t *)(dst_k + off) = 0x14000000 | (((long)stub_va - (long)va) >> 2 & 0x03FFFFFF);
+                break;
+            }
+        }
+        flush_icache_range((unsigned long)dst_k, (unsigned long)dst_k + PAGE_SIZE);
+        kunmap_local(dst_k); kunmap_local(src_k);
+
+        /* 5. 锁外初始化与 Notifier 注册 */
+        slot = kzalloc(sizeof(*slot), GFP_KERNEL);
+        if (!slot) { __free_page(new_p); put_page(old_p); continue; }
+        slot->va = va; slot->mm = mm; slot->orig_page = old_p; slot->shadow_page = new_p;
+        refcount_set(&slot->refs, 1); atomic_set(&slot->state, 1);
+        slot->notifier.ops = &shadow_ops;
+
+        if (mmu_notifier_register(&slot->notifier, mm)) { kfree(slot); __free_page(new_p); put_page(old_p); continue; }
+
+        /* 6. 页表手术 (事务起点) */
+        mmap_read_lock(mm);
+        pmd_t *pmd = wuwa_walk_to_pmd(mm, va);
+        if (!pmd || pmd_leaf(*pmd) || pmd_trans_huge(*pmd)) { ret = -EFAULT; goto err_rollback; }
+
+        /* ContPTE 安全检查与处理 */
+        ptep = pte_offset_map_lock(mm, pmd, va, &ptl);
+        bool is_cont = (ptep && (pte_val(*ptep) & (1ULL << 52)));
+        if (ptep) pte_unmap_unlock(ptep, ptl);
         
-        if (fault_pc == req->vaddr) {
-            /* 1. 条件判定逻辑 */
-            if (req->use_cond && fn_copy_from_user_nofault) {
-                uint32_t mem_val = 0;
-                uint64_t tgt_addr = user_regs->regs[req->cond_base_reg] + req->cond_offset;
-                if (fn_copy_from_user_nofault(&mem_val, (void __user *)tgt_addr, 4) == 0) {
-                    if (mem_val != req->cond_cmp_val) {
-                        user_regs->sp += req->false_add_sp;
-                        if (req->false_x0_modify) user_regs->regs[0] = req->false_x0_val;
-                        if (req->false_pc_behavior == PC_BEHAVIOR_RET) {
-                            user_regs->pc = user_regs->regs[30]; // 返回上一层
-                            goto swallow_exception;
-                        }
-                    }
-                }
-            }
-
-            /* 2. 通用寄存器修改 */
-            if (req->modify_x_idx < 32) user_regs->regs[req->modify_x_idx] = req->modify_x_val;
-            
-            /* 3. 控制流调度 */
-            if (req->pc_behavior == PC_BEHAVIOR_RET) {
-                user_regs->pc = user_regs->regs[30];
-            } else if (req->pc_behavior == PC_BEHAVIOR_JUMP) {
-                user_regs->pc = req->pc_jump_addr;
-            } else if (req->pc_behavior == PC_BEHAVIOR_SKIP) {
-                user_regs->pc = fault_pc + 4;
-            } else {
-                /* 原生执行流：引流至对应的预编译跳板 */
-                user_regs->pc = g_current_req.trampoline_base + (i * OOL_SLOT_SIZE);
-            }
-
-swallow_exception:
-            /* ★ 核心突破：Kprobe 哑弹劫持！
-             * 将内核执行流指向一个空函数，完美跳过真实的 do_mem_abort，
-             * 内核会自然 ERET 回到我们刚刚修改的 user_regs->pc 处！
-             */
-            instruction_pointer_set(kprobe_regs, (unsigned long)dummy_mem_abort);
-            read_unlock(&g_engine_lock);
-            return 1; 
+        if (is_cont) {
+            if (unfold_cont_group(mm, va, pmd) != 0) { ret = -EAGAIN; goto err_rollback; }
         }
-    }
-    read_unlock(&g_engine_lock);
-    return 0; // 不是目标地址，放行原生异常
-}
 
-static int pre_do_debug_exception(struct kprobe *p, struct pt_regs *kprobe_regs)
-{
-    unsigned int esr = kprobe_regs->regs[1];
-    struct pt_regs *user_regs = (struct pt_regs *)kprobe_regs->regs[2];
-    int ec = ESR_ELx_EC(esr);
-    unsigned long return_pc;
-    int i;
-
-    if (unlikely(ec != 0x3C || !user_regs || current->tgid != g_current_req.pid)) return 0;
-    if (unlikely((esr & 0xFFFF) != BRK_MAGIC_IMM)) return 0;
-
-    return_pc = user_regs->pc - 4; // 计算是哪个跳板触发的 BRK
-
-    read_lock(&g_engine_lock);
-    for (i = 0; i < g_current_req.hook_count; i++) {
-        unsigned long tramp_addr = g_current_req.trampoline_base + (i * OOL_SLOT_SIZE);
-        if (return_pc == tramp_addr) {
-            /* 闭环：跳板指令执行完毕，推进回原始 PC 的下一条指令 */
-            user_regs->pc = g_current_req.hooks[i].vaddr + 4;
-            
-            /* 同样使用哑弹劫持法吞掉 BRK 异常 */
-            instruction_pointer_set(kprobe_regs, (unsigned long)dummy_mem_abort);
-            read_unlock(&g_engine_lock);
-            return 1;
+        /* 拒绝非用户/非正常页 */
+        ptep = pte_offset_map_lock(mm, pmd, va, &ptl);
+        if (!ptep || !pte_present(*ptep) || pte_special(*ptep)) {
+            if (ptep) pte_unmap_unlock(ptep, ptl);
+            ret = -ENOENT; goto err_rollback;
         }
-    }
-    read_unlock(&g_engine_lock);
-    return 0;
-}
 
-/* ==========================================
- * 控制面：路由表构建 (AOT 预编译)
- * ========================================== */
-int wuwa_install_stealth(struct wuwa_stealth_req *req) 
-{
-    struct task_struct *task;
-    int i;
-    
-    if (!req) return -EINVAL;
-    
-    task = pid_task(find_vpid(req->pid), PIDTYPE_PID);
-    if (!task || !task->mm) return -ESRCH;
+        /* 基因替换 */
+        old_pte = *ptep;
+        slot->old_pte = old_pte;
+        u64 val = (pte_val(old_pte) & ~(PHYS_MASK & PAGE_MASK)) | (page_to_pfn(new_p) << PAGE_SHIFT);
+        set_pte_at(mm, va, ptep, __pte(val & ~(1ULL << 52)));
+        pte_unmap_unlock(ptep, ptl);
+        flush_tlb_mm_range(mm, va, va + PAGE_SIZE, PAGE_SHIFT, false);
+        pte_applied = true;
 
-    /* ★ 核心优化：在安全上下文预先写入用户态跳板 (AOT) ★ */
-    for (i = 0; i < req->hook_count; i++) {
-        if (req->hooks[i].pc_behavior == PC_BEHAVIOR_NONE) {
-            uint32_t insts[2] = {req->hooks[i].original_inst, BRK_MAGIC_INST};
-            unsigned long tramp_addr = req->trampoline_base + (i * OOL_SLOT_SIZE);
-            if (copy_to_user((void __user *)tramp_addr, insts, sizeof(insts))) {
-                wuwa_err("[Stealth] Failed to write AOT trampoline at 0x%lx\n", tramp_addr);
-                return -EFAULT;
+        /* 7. 索引落盘 (事务终点) */
+        if (xa_err(xa_store(&g_shadow_xa, (unsigned long)mm ^ va, slot, GFP_KERNEL))) {
+            ret = -ENOSPC; goto err_rollback;
+        }
+
+        mmap_read_unlock(mm);
+        continue; // 成功，继续处理下一个 Hook
+
+err_rollback:
+        /* 事务倒车：还原 PTE 避免 UAF */
+        if (pte_applied) {
+            ptep = pte_offset_map_lock(mm, pmd, va, &ptl);
+            if (ptep) {
+                set_pte_at(mm, va, ptep, slot->old_pte);
+                pte_unmap_unlock(ptep, ptl);
+                flush_tlb_mm_range(mm, va, va + PAGE_SIZE, PAGE_SHIFT, false);
             }
         }
+        mmap_read_unlock(mm);
+        mmu_notifier_unregister(&slot->notifier, mm);
+        kfree(slot);
+        __free_page(new_p);
+        put_page(old_p);
     }
 
-    write_lock(&g_engine_lock);
-    g_current_req = *req;
-    write_unlock(&g_engine_lock);
-
-    /* 置位 UXN */
-    for (i = 0; i < req->hook_count; i++) {
-        modify_page_uxn_baremetal(task, req->hooks[i].vaddr, true);
-        wuwa_info("[Stealth] UXN Trap set for 0x%llx\n", req->hooks[i].vaddr);
-    }
-    
-    return 0;
+    mmput(mm); put_task_struct(tsk); put_pid(pid_s);
+    return ret;
 }
 
-void wuwa_cleanup_stealth(void)
-{
-    struct task_struct *task;
-    int i;
-
-    write_lock(&g_engine_lock);
-    if (g_current_req.pid != 0) {
-        task = pid_task(find_vpid(g_current_req.pid), PIDTYPE_PID);
-        if (task && task->mm) {
-            for (i = 0; i < g_current_req.hook_count; i++) {
-                modify_page_uxn_baremetal(task, g_current_req.hooks[i].vaddr, false);
-            }
-        }
-        g_current_req.pid = 0;
-    }
-    write_unlock(&g_engine_lock);
-    wuwa_info("[Stealth] Cleaned up PTE UXN hooks.\n");
-}
-
-int wuwa_stealth_init(void)
-{
-    int ret;
-    
-    fn_copy_from_user_nofault = (void *)kallsyms_lookup_name_ex("copy_from_user_nofault");
-    if (!fn_copy_from_user_nofault) {
-        fn_copy_from_user_nofault = (void *)kallsyms_lookup_name_ex("probe_kernel_read");
-    }
-    
-    kp_mem_abort.symbol_name = "do_mem_abort";
-    kp_mem_abort.pre_handler = pre_do_mem_abort;
-    ret = register_kprobe(&kp_mem_abort);
-    
-    kp_brk_handler.symbol_name = "do_debug_exception";
-    kp_brk_handler.pre_handler = pre_do_debug_exception;
-    ret |= register_kprobe(&kp_brk_handler);
-
-    if (ret < 0) {
-        wuwa_err("[Stealth] Kprobe init failed.\n");
-        return ret;
-    }
-    
-    wuwa_info("[Stealth] PTE UXN Engine Core initialized.\n");
-    return 0;
-}
-
-void wuwa_stealth_cleanup(void)
-{
-    wuwa_cleanup_stealth();
-    unregister_kprobe(&kp_mem_abort);
-    unregister_kprobe(&kp_brk_handler);
-}
+/* 兼容原始的导出与注销 */
+int wuwa_hbp_init_device(void) { return 0; }
+void wuwa_hbp_cleanup_device(void) { /* 生命周期已交由 mmu_notifier 自动管理 */ }
+void wuwa_cleanup_perf_hbp(void) { }
