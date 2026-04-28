@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * wuwa_perf_hbp.c — V18.9 "Supercell" 旗舰生产版 (编译修复版)
+ * wuwa_perf_hbp.c — V18.9 "Supercell" 旗舰生产版 (编译终极修复)
  * * 核心特性：
  * 1. 修复 Action 3 丢失：显式硬编码处理 JUMP_B 逻辑。
  * 2. 暴力同步：引入 ic ialluis 指令级全局刷新，强制所有 CPU 核心重新加载指令。
  * 3. 事务隔离：Snapshot 模式，先准备物理页，锁内只做 8 字节 PTE 修改。
- * 4. 零遗漏清理：针对所有 continue 分支提供统一的资源释放入口。
- * 5. 编译修复：解决 uint64_t 打印格式导致的 -Werror 报错。
+ * 4. 编译修复：移除 ARM64 不支持的 32位 bpiallis 指令，纯净 AArch64 架构兼容。
  */
 
 #include <linux/version.h>
@@ -48,19 +47,18 @@ static inline void nuclear_sync_all_cores(struct mm_struct *mm, unsigned long va
 #endif
     addr_val = (asid << 48) | (va >> 12);
 
-    /* 1. 强制数据同步屏障：确保内存写入已完成 */
+    /* 1. 强制数据同步屏障：确保前面的 PTE 写入已彻底落盘 */
     dsb(sy);
     
-    /* 2. 精准 TLB 刷新 (vae1is) */
+    /* 2. 精准 TLB 刷新 (vae1is): 带着 ASID 跨核心刷新翻译缓存 */
     __asm__ __volatile__ ("tlbi vae1is, %0" : : "r" (addr_val) : "memory");
-    
-    /* 3. 全局指令缓存作废 (ic ialluis)：对付 RET/B 跳转的关键 */
+    dsb(sy); /* 等待 TLBI 广播完成 */
+
+    /* 3. 全局指令缓存作废 (ic ialluis)：强制所有核心丢弃 L1 I-Cache */
+    /* ARM64 架构下，此指令会自动引发分支预测器(Branch Predictor)的同步 */
     __asm__ __volatile__ ("ic ialluis" : : : "memory");
     
-    /* 4. 分支预测器作废：防止 CPU 预测到旧的 B 跳转路径 */
-    __asm__ __volatile__ ("bpiallis" : : : "memory");
-
-    /* 5. 最终系统同步 */
+    /* 4. 最终系统指令屏障：清空流水线，强制下一条指令重新取指 */
     dsb(sy);
     isb();
 }
@@ -112,13 +110,11 @@ static int build_patch_instruction(u8 *dst_k, size_t off, struct shadow_patch_re
             long j_off = (long)preq->target_va - (long)va;
             /* 检查 B 指令跳转极限：±128MB */
             if ((preq->target_va & 3) || (j_off < -134217728LL) || (j_off > 134217724LL)) {
-                /* 修复了 uint64_t 打印导致的编译错误 */
                 pr_err("[wuwa] B Jump target out of range! Target: 0x%llx, PC: 0x%lx\n", 
                        (unsigned long long)preq->target_va, va);
                 return -ERANGE;
             }
             *(uint32_t *)(dst_k + off) = 0x14000000 | ((j_off >> 2) & 0x03FFFFFF);
-            /* 修复了 uint64_t 打印导致的编译错误 */
             pr_info("[wuwa] Jump B patch: Target 0x%llx applied at 0x%lx\n", 
                     (unsigned long long)preq->target_va, va);
             break;
