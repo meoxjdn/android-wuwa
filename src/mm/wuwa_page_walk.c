@@ -207,3 +207,20 @@ void traverse_page_tables(struct mm_struct* mm, struct page_walk_stats* stats) {
 
     MM_READ_UNLOCK(mm);
 }
+
+/* ========================================================
+ * 新增辅助：用于影子内存页表手术的安全 PMD 获取
+ * 包含对巨页 (HugePage) 的严格拒绝逻辑
+ * ======================================================== */
+pmd_t *wuwa_walk_to_pmd(struct mm_struct *mm, unsigned long va) {
+    pgd_t *pgd = pgd_offset(mm, va);
+    if (pgd_none(*pgd) || pgd_bad(*pgd)) return NULL;
+    
+    p4d_t *p4d = p4d_offset(pgd, va);
+    if (p4d_none(*p4d) || p4d_bad(*p4d)) return NULL;
+    
+    pud_t *pud = pud_offset(p4d, va);
+    if (pud_none(*pud) || pud_bad(*pud) || pud_leaf(*pud)) return NULL;
+    
+    return pmd_offset(pud, va);
+}
