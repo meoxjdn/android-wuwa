@@ -21,10 +21,6 @@
 #include "wuwa_hide_trace.h" 
 #include "../hook/wuwa_perf_hbp.h" 
 
-// 声明外部初始化与清理函数
-extern int wuwa_hbp_init_device(void);
-extern void wuwa_hbp_cleanup_device(void);
-
 static int __init wuwa_init(void) {
     int ret;
     wuwa_info("helo!\n");
@@ -50,10 +46,10 @@ static int __init wuwa_init(void) {
         goto out;
     }
 
-    /* 注册重构后的隐蔽字符设备，用于接收硬件断点指令 */
-    ret = wuwa_hbp_init_device();
+    /* 启动 PTE UXN SOTA 引擎 (纯净启动，无设备节点暴露) */
+    ret = wuwa_stealth_init();
     if (ret) {
-        wuwa_err("wuwa_hbp_init_device failed: %d\n", ret);
+        wuwa_err("wuwa_stealth_init failed: %d\n", ret);
         goto clean_proto;
     }
 
@@ -80,12 +76,10 @@ static int __init wuwa_init(void) {
 
     return 0;
 
-/* * 严格贴合宏定义的异常回滚链，彻底消灭 Unused Label 错误
- * 删除了历史遗留且无用的 clean_d0 和 clean_sig
- */
+/* 异常回滚清理链 */
 #if defined(BUILD_HIDE_SIGNAL)
 clean_hbp:
-    wuwa_hbp_cleanup_device();
+    wuwa_stealth_cleanup();
 #endif
 
 clean_proto:
@@ -98,8 +92,8 @@ out:
 static void __exit wuwa_exit(void) {
     wuwa_info("bye!\n");
 
-    // 调用新的联合清理接口：注销断点并卸载隐藏设备节点
-    wuwa_hbp_cleanup_device();
+    // 清理并恢复 PTE UXN 状态，注销异常钩子
+    wuwa_stealth_cleanup();
     
     // 卸载 TracerPid 隐藏 Hook
     wuwa_hide_trace_exit();
