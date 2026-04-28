@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * wuwa_perf_hbp.c — V18.9 "Supercell" 旗舰生产版
+ * wuwa_perf_hbp.c — V18.9 "Supercell" 旗舰生产版 (编译修复版)
  * * 核心特性：
  * 1. 修复 Action 3 丢失：显式硬编码处理 JUMP_B 逻辑。
  * 2. 暴力同步：引入 ic ialluis 指令级全局刷新，强制所有 CPU 核心重新加载指令。
  * 3. 事务隔离：Snapshot 模式，先准备物理页，锁内只做 8 字节 PTE 修改。
  * 4. 零遗漏清理：针对所有 continue 分支提供统一的资源释放入口。
+ * 5. 编译修复：解决 uint64_t 打印格式导致的 -Werror 报错。
  */
 
 #include <linux/version.h>
@@ -111,11 +112,15 @@ static int build_patch_instruction(u8 *dst_k, size_t off, struct shadow_patch_re
             long j_off = (long)preq->target_va - (long)va;
             /* 检查 B 指令跳转极限：±128MB */
             if ((preq->target_va & 3) || (j_off < -134217728LL) || (j_off > 134217724LL)) {
-                pr_err("[wuwa] B Jump target out of range! Target: 0x%lx, PC: 0x%lx\n", preq->target_va, va);
+                /* 修复了 uint64_t 打印导致的编译错误 */
+                pr_err("[wuwa] B Jump target out of range! Target: 0x%llx, PC: 0x%lx\n", 
+                       (unsigned long long)preq->target_va, va);
                 return -ERANGE;
             }
             *(uint32_t *)(dst_k + off) = 0x14000000 | ((j_off >> 2) & 0x03FFFFFF);
-            pr_info("[wuwa] Jump B patch: Target 0x%lx applied at 0x%lx\n", preq->target_va, va);
+            /* 修复了 uint64_t 打印导致的编译错误 */
+            pr_info("[wuwa] Jump B patch: Target 0x%llx applied at 0x%lx\n", 
+                    (unsigned long long)preq->target_va, va);
             break;
         }
         default:
@@ -214,7 +219,7 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
         WRITE_ONCE(*(u64 *)ptep, val);
         pte_unmap_unlock(ptep, ptl);
 
-        /* ★ 核心：执行全核缓存同步 */
+        /* ★ 核心：执行全核指令缓存同步 */
         nuclear_sync_all_cores(mm, slot->va);
 
         prep_slots[i] = NULL; 
