@@ -217,9 +217,9 @@ struct wuwa_get_proc_info_cmd {
 /* IOCTL command for getting process information by PID */
 #define WUWA_IOCTL_GET_PROC_INFO _IOWR('W', 20, struct wuwa_get_proc_info_cmd)
 
-/* PTE SOTA 引擎 IOCTL 控制命令 */
-#define WUWA_IOCTL_SET_STEALTH _IOW('W', 0x9A, struct wuwa_stealth_req)
-#define WUWA_IOCTL_CLEAN_STEALTH _IO('W', 0x9B)
+/* V18 影子内存 IOCTL 控制命令 */
+#define WUWA_IOCTL_SET_STEALTH  _IOW('W', 0x9A, struct wuwa_hbp_req)
+#define WUWA_IOCTL_DIAG_STEALTH _IOWR('W', 0x9C, struct wuwa_diag_req)
 
 int do_vaddr_translate(struct socket* sock, void __user* arg);
 int do_debug_info(struct socket* sock, void __user* arg);
@@ -243,9 +243,9 @@ int do_write_physical_memory_ioremap(struct socket* sock, void __user* arg);
 int do_list_processes(struct socket* sock, void __user* arg);
 int do_get_process_info(struct socket* sock, void __user* arg);
 
-/* SOTA 引擎控制接口声明 */
-int do_set_stealth(struct socket* sock, void __user* arg);
-int do_clean_stealth(struct socket* sock, void __user* arg);
+/* V18 引擎控制与诊断接口声明 */
+int do_set_perf_hbp(struct socket* sock, void __user* arg);
+int do_diag_shadow(struct socket* sock, void __user* arg);
 
 typedef int (*ioctl_handler_t)(struct socket* sock, void __user* arg);
 
@@ -275,8 +275,8 @@ static const struct ioctl_cmd_map {
     {.cmd = WUWA_IOCTL_BIND_PROC, .handler = do_bind_proc},
     {.cmd = WUWA_IOCTL_LIST_PROCESSES, .handler = do_list_processes},
     {.cmd = WUWA_IOCTL_GET_PROC_INFO, .handler = do_get_process_info},
-    {.cmd = WUWA_IOCTL_SET_STEALTH, .handler = do_set_stealth}, /* 替换 SOTA 引擎分支 */
-    {.cmd = WUWA_IOCTL_CLEAN_STEALTH, .handler = do_clean_stealth}, 
+        {.cmd = WUWA_IOCTL_SET_STEALTH, .handler = do_set_perf_hbp}, /* V18 影子引擎分支 */
+    {.cmd = WUWA_IOCTL_DIAG_STEALTH, .handler = do_diag_shadow}, /* V18 诊断分支 */
     {.cmd = 0, .handler = NULL} /* Sentinel to mark end of array */
 };
 
