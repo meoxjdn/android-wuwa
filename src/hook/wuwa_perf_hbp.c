@@ -13,7 +13,7 @@
 
 #include "../core/wuwa_common.h"
 #include "wuwa_perf_hbp.h"
-#include "../utils/wuwa_utils.h"
+#include "../utils/wuwa_utils.h" /* 引入 kallsyms_lookup_name_ex */
 
 #define OOL_SLOT_SIZE 64
 #define PTE_UXN_BIT   (1ULL << 54)
@@ -45,8 +45,11 @@ static DEFINE_SPINLOCK(g_hash_lock);
 static struct kprobe kp_mem_abort;
 static struct kprobe kp_brk_handler;
 
+/* 动态解析函数指针，彻底避开 Android 15 的 export 限制 */
+static long (*fn_copy_from_user_nofault)(void *dst, const void __user *src, size_t size) = NULL;
+
 /* ==========================================
- * PTE 操作模块 (复用 wuwa_page_walk 的思维)
+ * PTE 强暴修改模块 (绕过 MTE 与 ContPTE)
  * ========================================== */
 static int modify_page_uxn_safe(struct task_struct *tsk, unsigned long vaddr, bool set_uxn)
 {
@@ -54,6 +57,7 @@ static int modify_page_uxn_safe(struct task_struct *tsk, unsigned long vaddr, bo
     pgd_t *pgd; p4d_t *p4d; pud_t *pud; pmd_t *pmd; pte_t *pte;
     spinlock_t *ptl;
     pte_t old_pte, new_pte;
+    unsigned long tlbi_addr;
     int ret = 0;
 
     mm = get_task_mm(tsk);
@@ -74,10 +78,22 @@ static int modify_page_uxn_safe(struct task_struct *tsk, unsigned long vaddr, bo
 
     old_pte = *pte;
     new_pte = set_uxn ? __pte(pte_val(old_pte) | PTE_UXN_BIT) : __pte(pte_val(old_pte) & ~PTE_UXN_BIT);
-    set_pte_at(mm, vaddr, pte, new_pte);
+    
+    /* * ★ 核心突破 1：不准用 set_pte_at！ 
+     * 直接对 PTE 的物理内存强制覆盖 8 字节，绕过 __contpte_try_fold 和 mte_sync_tags 
+     */
+    WRITE_ONCE(*((u64 *)pte), pte_val(new_pte));
+    
     pte_unmap_unlock(pte, ptl);
 
-    flush_tlb_page(vma_lookup(mm, vaddr), vaddr);
+    /* * ★ 核心突破 2：不准用 flush_tlb_page！
+     * 直接手写 ARM64 TLB 刷新汇编指令，绕过 mmu_notifier 限制
+     */
+    tlbi_addr = vaddr >> 12;
+    asm volatile("dsb ishst");
+    asm volatile("tlbi vae1is, %0" : : "r"(tlbi_addr));
+    asm volatile("dsb ish");
+    asm volatile("isb");
 
 out:
     mmap_read_unlock(mm);
@@ -186,11 +202,11 @@ static int pre_do_mem_abort(struct kprobe *p, struct pt_regs *kprobe_regs)
             ts = get_or_create_thread_state(current);
             if (!ts || ts->state == OOL_EXECUTING) break; 
 
-            // 条件判定逻辑
-            if (req->use_cond) {
+            // 条件判定逻辑 (使用动态解析的安全内存读取)
+            if (req->use_cond && fn_copy_from_user_nofault) {
                 uint32_t mem_val = 0;
                 uint64_t tgt_addr = user_regs->regs[req->cond_base_reg] + req->cond_offset;
-                if (copy_from_user_nofault(&mem_val, (void __user *)tgt_addr, 4) == 0) {
+                if (fn_copy_from_user_nofault(&mem_val, (void __user *)tgt_addr, 4) == 0) {
                     if (mem_val != req->cond_cmp_val) {
                         user_regs->sp += req->false_add_sp;
                         if (req->false_x0_modify) user_regs->regs[0] = req->false_x0_val;
@@ -203,10 +219,9 @@ static int pre_do_mem_abort(struct kprobe *p, struct pt_regs *kprobe_regs)
                 }
             }
 
-            // 常规修改
             if (req->modify_x_idx < 32) user_regs->regs[req->modify_x_idx] = req->modify_x_val;
             
-            // 劫持调度：如果行为不是 NONE，我们可以免除 OOL 跳板！
+            // 劫持调度
             if (req->pc_behavior == PC_BEHAVIOR_RET) {
                 instruction_pointer_set(kprobe_regs, user_regs->regs[30]);
                 read_unlock(&g_engine_lock);
@@ -306,6 +321,14 @@ void wuwa_cleanup_stealth(void)
 int wuwa_stealth_init(void)
 {
     int ret;
+    
+    /* ★ 核心突破 3：动态解析 copy_from_user_nofault ★ */
+    fn_copy_from_user_nofault = (void *)kallsyms_lookup_name_ex("copy_from_user_nofault");
+    if (!fn_copy_from_user_nofault) {
+        /* 内核可能将此函数重命名了（如 probe_kernel_read），我们优雅降级 */
+        wuwa_warn("[Stealth] copy_from_user_nofault NOT FOUND. Condition eval may be skipped.\n");
+    }
+    
     kp_mem_abort.symbol_name = "do_mem_abort";
     kp_mem_abort.pre_handler = pre_do_mem_abort;
     ret = register_kprobe(&kp_mem_abort);
