@@ -2,7 +2,7 @@
 /*
  * wuwa_perf_hbp.c — V18 事务级静态影子内存引擎 (终极点火版)
  */
-
+#include <linux/version.h>
 #include <linux/mm.h>
 #include <linux/mmu_notifier.h>
 #include <linux/xarray.h>
@@ -140,8 +140,12 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
             continue;
         }
 
-        /* 2. 物理准备：强制 COW 获取原始页 */
+        /* 2. 物理准备：强制 COW 获取原始页 (兼容 6.5+ 新内核) */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)
+        if (get_user_pages_remote(mm, va, 1, FOLL_WRITE | FOLL_FORCE, &old_p, NULL) <= 0) continue;
+#else
         if (get_user_pages_remote(mm, va, 1, FOLL_WRITE | FOLL_FORCE, &old_p, NULL, NULL) <= 0) continue;
+#endif
         new_p = alloc_page(GFP_HIGHUSER);
         if (!new_p) { put_page(old_p); continue; }
 
