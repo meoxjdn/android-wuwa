@@ -18,7 +18,36 @@
 #include "../core/wuwa_common.h"
 
 extern pmd_t *wuwa_walk_to_pmd(struct mm_struct *mm, unsigned long va);
+extern unsigned long kallsyms_lookup_name_ex(const char *name);
 
+/* ==========================================================
+ * 0. GKI 符号动态解析 (绕过 Android 15 EXPORT_SYMBOL 限制)
+ * ========================================================== */
+typedef int (*register_mn_fn)(struct mmu_notifier *, struct mm_struct *);
+typedef void (*unregister_mn_fn)(struct mmu_notifier *, struct mm_struct *);
+typedef void (*flush_tlb_fn)(struct mm_struct *, unsigned long, unsigned long, unsigned long, bool);
+
+static register_mn_fn   fn_mmu_notifier_register = NULL;
+static unregister_mn_fn fn_mmu_notifier_unregister = NULL;
+static flush_tlb_fn     fn_flush_tlb_mm_range = NULL;
+
+static int resolve_gki_symbols(void) {
+    if (fn_mmu_notifier_register) return 0; // 已解析
+
+    fn_mmu_notifier_register = (register_mn_fn)kallsyms_lookup_name_ex("mmu_notifier_register");
+    fn_mmu_notifier_unregister = (unregister_mn_fn)kallsyms_lookup_name_ex("mmu_notifier_unregister");
+    fn_flush_tlb_mm_range = (flush_tlb_fn)kallsyms_lookup_name_ex("flush_tlb_mm_range");
+
+    if (!fn_mmu_notifier_register || !fn_mmu_notifier_unregister || !fn_flush_tlb_mm_range) {
+        wuwa_err("Critical: Failed to lookup MMU Notifier / TLB symbols.\n");
+        return -ENOSYS;
+    }
+    return 0;
+}
+
+/* ==========================================================
+ * 基础结构定义
+ * ========================================================== */
 struct shadow_slot {
     unsigned long va;
     struct page *orig_page;
@@ -73,11 +102,15 @@ static int unfold_cont_group(struct mm_struct *mm, unsigned long addr, pmd_t *pm
     for (i = 0; i < 16; i++) {
         if (pte_val(ptep[i]) & (1ULL << 52)) {
             pte_t pte = ptep_get_and_clear(mm, start + (i * PAGE_SIZE), &ptep[i]);
-            set_pte_at(mm, start + (i * PAGE_SIZE), &ptep[i], __pte(pte_val(pte) & ~(1ULL << 52)));
+            /* ⚠️ 绕过 set_pte_at 导致的 mte_sync_tags 和 __contpte_try_fold 报错 */
+            WRITE_ONCE(*(u64 *)&ptep[i], pte_val(pte) & ~(1ULL << 52));
         }
     }
     pte_unmap_unlock(ptep, ptl);
-    flush_tlb_mm_range(mm, start, start + (PAGE_SIZE * 16), PAGE_SHIFT, false);
+    
+    if (fn_flush_tlb_mm_range) {
+        fn_flush_tlb_mm_range(mm, start, start + (PAGE_SIZE * 16), PAGE_SHIFT, false);
+    }
     return 0;
 }
 
@@ -113,11 +146,15 @@ int wuwa_diag_shadow_slot(struct wuwa_diag_req *req) {
  * 4. 核心安装引擎：全路径失败回滚 + PTE 语义克隆
  * ========================================================== */
 int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
-    struct pid *pid_s = find_get_pid(req->tid);
+    struct pid *pid_s;
     struct task_struct *tsk;
     struct mm_struct *mm;
     int i, ret = 0;
 
+    /* 初始化 GKI 符号 */
+    if (resolve_gki_symbols() != 0) return -ENOSYS;
+
+    pid_s = find_get_pid(req->tid);
     if (!pid_s) return -ESRCH;
     tsk = get_pid_task(pid_s, PIDTYPE_PID);
     if (!tsk) { put_pid(pid_s); return -ESRCH; }
@@ -197,7 +234,7 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
         refcount_set(&slot->refs, 1); atomic_set(&slot->state, 1);
         slot->notifier.ops = &shadow_ops;
 
-        if (mmu_notifier_register(&slot->notifier, mm)) { kfree(slot); __free_page(new_p); put_page(old_p); continue; }
+        if (fn_mmu_notifier_register(&slot->notifier, mm)) { kfree(slot); __free_page(new_p); put_page(old_p); continue; }
 
         /* 6. 页表手术 (事务起点) */
         mmap_read_lock(mm);
@@ -220,13 +257,14 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
             ret = -ENOENT; goto err_rollback;
         }
 
-        /* 基因替换 */
+        /* 基因替换 - ⚠️ 直接用 WRITE_ONCE 绕过 set_pte_at */
         old_pte = *ptep;
         slot->old_pte = old_pte;
         u64 val = (pte_val(old_pte) & ~(PHYS_MASK & PAGE_MASK)) | (page_to_pfn(new_p) << PAGE_SHIFT);
-        set_pte_at(mm, va, ptep, __pte(val & ~(1ULL << 52)));
+        WRITE_ONCE(*(u64 *)ptep, val & ~(1ULL << 52));
         pte_unmap_unlock(ptep, ptl);
-        flush_tlb_mm_range(mm, va, va + PAGE_SIZE, PAGE_SHIFT, false);
+        
+        fn_flush_tlb_mm_range(mm, va, va + PAGE_SIZE, PAGE_SHIFT, false);
         pte_applied = true;
 
         /* 7. 索引落盘 (事务终点) */
@@ -242,13 +280,13 @@ err_rollback:
         if (pte_applied) {
             ptep = pte_offset_map_lock(mm, pmd, va, &ptl);
             if (ptep) {
-                set_pte_at(mm, va, ptep, slot->old_pte);
+                WRITE_ONCE(*(u64 *)ptep, pte_val(slot->old_pte));
                 pte_unmap_unlock(ptep, ptl);
-                flush_tlb_mm_range(mm, va, va + PAGE_SIZE, PAGE_SHIFT, false);
+                fn_flush_tlb_mm_range(mm, va, va + PAGE_SIZE, PAGE_SHIFT, false);
             }
         }
         mmap_read_unlock(mm);
-        mmu_notifier_unregister(&slot->notifier, mm);
+        fn_mmu_notifier_unregister(&slot->notifier, mm);
         kfree(slot);
         __free_page(new_p);
         put_page(old_p);
