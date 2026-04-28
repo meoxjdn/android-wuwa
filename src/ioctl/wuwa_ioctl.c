@@ -17,7 +17,7 @@
 
 #include "wuwa_proc.h"
 #include "wuwa_safe_signal.h"
-#include "../hook/wuwa_perf_hbp.h"
+#include "../hook/wuwa_perf_hbp.h" /* 包含 PTE SOTA 引擎头文件 */
 
 int do_vaddr_translate(struct socket* sock, void* arg) {
     struct wuwa_addr_translate_cmd cmd;
@@ -825,23 +825,21 @@ int do_get_process_info(struct socket* sock, void __user* arg) {
 }
 
 /* ================================================================
- * Perf HBP 内核硬件断点通信处理函数
+ * PTE UXN Stealth 引擎控制接口处理函数
  * ================================================================ */
-int do_set_perf_hbp(struct socket* sock, void __user* arg) {
-    struct wuwa_hbp_req req;
-
-    /* 水印：确认函数被调用 */
-    pr_info("[wuwa] ===== do_set_perf_hbp CALLED =====\n");
+int do_set_stealth(struct socket* sock, void __user* arg) {
+    struct wuwa_stealth_req req;
 
     if (copy_from_user(&req, arg, sizeof(req))) {
-        pr_err("[wuwa] copy_from_user failed\n");
+        wuwa_err("[Stealth] copy_from_user failed\n");
         return -EFAULT;
     }
+    
+    wuwa_info("[Stealth] Installing PTE Trap for PID: %d, Hooks: %d\n", req.pid, req.hook_count);
+    return wuwa_install_stealth(&req);
+}
 
-    pr_info("[wuwa] req: tid=%d base=0x%llx fov=%d border=%d "
-            "skip=%d damage=%d maxhp=%d\n",
-            req.tid, req.base_addr, req.fov_on, req.border_on,
-            req.skip_on, req.damage_on, req.maxhp_on);
-
-    return wuwa_install_perf_hbp(&req);
+int do_clean_stealth(struct socket* sock, void __user* arg) {
+    wuwa_cleanup_stealth();
+    return 0;
 }
