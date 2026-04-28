@@ -274,18 +274,18 @@ static struct miscdevice core_misc = {
     .fops  = &core_fops,
 };
 
-int wuwa_hbp_init_device(void) {
-    return misc_register(&core_misc);
-}
-
-void wuwa_hbp_cleanup_device(void) {
-    misc_deregister(&core_misc);
-}
-
+int wuwa_hbp_init_device(void) { return 0; }
+void wuwa_hbp_cleanup_device(void) { }
 void wuwa_cleanup_perf_hbp(void) { }
 
 /* ==========================================================
- * 5. 填补漏编模块的符号占位 (防止 Unknown Symbol)
+ * 5. 在主入口真正注册设备 (修复 /dev 节点不生成的问题)
  * ========================================================== */
-int wuwa_stealth_init(void) { return 0; }
-void wuwa_stealth_cleanup(void) { }
+int wuwa_stealth_init(void) { 
+    /* wuwa.c 必定会调用 stealth_init，所以必须在这里注册设备 */
+    return misc_register(&core_misc);
+}
+
+void wuwa_stealth_cleanup(void) { 
+    misc_deregister(&core_misc);
+}
