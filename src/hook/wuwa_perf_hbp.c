@@ -1,11 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
-/*
- * wuwa_perf_hbp.c — PTE UXN + OOL 多线程状态机引擎 (融入主模块版)
- * 架构特点：零 Inline Hook 内存修改，原生指令 OOL 推进，Epoch 防 ABA，无痕 Lazy GC。
- * 通信架构：由 wuwa_ioctl 驱动，无 /dev 节点。
- */
-
-#include <linux/module.h>
 #include <linux/kprobes.h>
 #include <linux/sched.h>
 #include <linux/mm.h>
@@ -18,57 +10,18 @@
 #include <asm/tlbflush.h>
 #include <asm/ptrace.h>
 #include <asm/esr.h>
-#include <asm/cacheflush.h>
 
-/* 此头文件应包含你在 ioctl 中定义的 struct stealth_req */
-// #include "wuwa_perf_hbp.h" 
+#include "../core/wuwa_common.h"
+#include "wuwa_perf_hbp.h"
+#include "../utils/wuwa_utils.h"
 
-#define MAX_HOOKS 16
 #define OOL_SLOT_SIZE 64
-#define MAX_OOL_SLOTS 256
-#define GC_WATERMARK  (MAX_OOL_SLOTS - 16)
 #define PTE_UXN_BIT   (1ULL << 54)
-
+#define GC_WATERMARK  (MAX_OOL_SLOTS - 16)
 #define BRK_MAGIC_IMM 0x1337
 #define BRK_MAGIC_INST (0xD4200000 | (BRK_MAGIC_IMM << 5))
 
-#pragma pack(push, 8)
-struct hook_request {
-    uint64_t vaddr;
-    uint32_t original_inst; 
-    
-    uint32_t modify_x_idx;
-    uint64_t modify_x_val;
-    uint32_t modify_s_idx;
-    uint32_t modify_s_val;
-    uint32_t add_sp_val;
-    
-    uint32_t pc_behavior;
-    uint64_t pc_jump_addr;
-    
-    uint32_t use_cond;
-    uint32_t cond_base_reg;
-    uint32_t cond_offset;
-    uint32_t cond_cmp_val;
-    
-    uint32_t false_x0_modify;
-    uint64_t false_x0_val;
-    uint32_t false_add_sp;
-    uint32_t false_pc_behavior;
-};
-
-struct stealth_req {
-    int      pid;
-    uint64_t trampoline_base; 
-    uint32_t hook_count;
-    struct   hook_request hooks[MAX_HOOKS];
-};
-#pragma pack(pop)
-
-enum ool_state {
-    OOL_IDLE = 0,
-    OOL_EXECUTING = 1
-};
+enum ool_state { OOL_IDLE = 0, OOL_EXECUTING = 1 };
 
 struct thread_ool_state {
     pid_t tid;
@@ -79,7 +32,7 @@ struct thread_ool_state {
     struct hlist_node node;
 };
 
-static struct stealth_req g_current_req;
+static struct wuwa_stealth_req g_current_req;
 static DEFINE_RWLOCK(g_engine_lock);
 
 static DECLARE_BITMAP(g_ool_bitmap, MAX_OOL_SLOTS);
@@ -93,7 +46,7 @@ static struct kprobe kp_mem_abort;
 static struct kprobe kp_brk_handler;
 
 /* ==========================================
- * 内存与权限控制模块
+ * PTE 操作模块 (复用 wuwa_page_walk 的思维)
  * ========================================== */
 static int modify_page_uxn_safe(struct task_struct *tsk, unsigned long vaddr, bool set_uxn)
 {
@@ -115,6 +68,7 @@ static int modify_page_uxn_safe(struct task_struct *tsk, unsigned long vaddr, bo
     if (pud_none(*pud) || pud_bad(*pud)) { ret = -EFAULT; goto out; }
     pmd = pmd_offset(pud, vaddr);
     if (pmd_none(*pmd) || pmd_bad(*pmd)) { ret = -EFAULT; goto out; }
+    
     pte = pte_offset_map_lock(mm, pmd, vaddr, &ptl);
     if (!pte) { ret = -EFAULT; goto out; }
 
@@ -132,14 +86,14 @@ out:
 }
 
 /* ==========================================
- * OOL 状态机与垃圾回收 (Lazy GC)
+ * OOL 状态机与 Lazy GC
  * ========================================== */
 static void stealth_lazy_gc_locked(void)
 {
     struct thread_ool_state *ts;
     struct hlist_node *tmp;
     struct task_struct *tsk;
-    int bkt, reclaimed = 0;
+    int bkt;
 
     hash_for_each_safe(g_ool_hash, bkt, tmp, ts, node) {
         if (ts->state == OOL_IDLE) continue;
@@ -155,7 +109,6 @@ static void stealth_lazy_gc_locked(void)
 
             hash_del(&ts->node);
             kfree(ts);
-            reclaimed++;
         }
         rcu_read_unlock();
     }
@@ -169,7 +122,6 @@ static struct thread_ool_state *get_or_create_thread_state(struct task_struct *c
     int slot_idx, used_slots;
 
     spin_lock(&g_hash_lock);
-
     hash_for_each_possible(g_ool_hash, ts, node, tid) {
         if (ts->tid == tid) {
             if (unlikely(ts->epoch != current_epoch)) {
@@ -213,7 +165,7 @@ out_unlock:
 }
 
 /* ==========================================
- * 核心拦截路由 (异常流调度)
+ * Kprobe 异常分流中枢
  * ========================================== */
 static int pre_do_mem_abort(struct kprobe *p, struct pt_regs *kprobe_regs)
 {
@@ -234,10 +186,42 @@ static int pre_do_mem_abort(struct kprobe *p, struct pt_regs *kprobe_regs)
             ts = get_or_create_thread_state(current);
             if (!ts || ts->state == OOL_EXECUTING) break; 
 
-            if (req->modify_x_idx < 32) {
-                user_regs->regs[req->modify_x_idx] = req->modify_x_val;
+            // 条件判定逻辑
+            if (req->use_cond) {
+                uint32_t mem_val = 0;
+                uint64_t tgt_addr = user_regs->regs[req->cond_base_reg] + req->cond_offset;
+                if (copy_from_user_nofault(&mem_val, (void __user *)tgt_addr, 4) == 0) {
+                    if (mem_val != req->cond_cmp_val) {
+                        user_regs->sp += req->false_add_sp;
+                        if (req->false_x0_modify) user_regs->regs[0] = req->false_x0_val;
+                        if (req->false_pc_behavior == PC_BEHAVIOR_RET) {
+                            instruction_pointer_set(kprobe_regs, user_regs->regs[30]);
+                        }
+                        read_unlock(&g_engine_lock);
+                        return 1;
+                    }
+                }
             }
 
+            // 常规修改
+            if (req->modify_x_idx < 32) user_regs->regs[req->modify_x_idx] = req->modify_x_val;
+            
+            // 劫持调度：如果行为不是 NONE，我们可以免除 OOL 跳板！
+            if (req->pc_behavior == PC_BEHAVIOR_RET) {
+                instruction_pointer_set(kprobe_regs, user_regs->regs[30]);
+                read_unlock(&g_engine_lock);
+                return 1;
+            } else if (req->pc_behavior == PC_BEHAVIOR_JUMP) {
+                instruction_pointer_set(kprobe_regs, req->pc_jump_addr);
+                read_unlock(&g_engine_lock);
+                return 1;
+            } else if (req->pc_behavior == PC_BEHAVIOR_SKIP) {
+                instruction_pointer_set(kprobe_regs, user_regs->pc + 4);
+                read_unlock(&g_engine_lock);
+                return 1;
+            }
+
+            // 原始指令推进：挂载 OOL
             uint32_t insts[2] = {req->original_inst, BRK_MAGIC_INST};
             if (copy_to_user((void __user *)ts->slot_uaddr, insts, sizeof(insts)) == 0) {
                 ts->original_pc = user_regs->pc;
@@ -278,16 +262,12 @@ static int pre_do_debug_exception(struct kprobe *p, struct pt_regs *kprobe_regs)
 }
 
 /* ==========================================
- * 提供给 wuwa_ioctl.c 调用的控制接口
+ * 控制接口
  * ========================================== */
-
-/* 安装 PTE UXN 载荷 */
-int wuwa_install_perf_hbp(void *raw_req) 
+int wuwa_install_stealth(struct wuwa_stealth_req *req) 
 {
-    struct stealth_req *req = (struct stealth_req *)raw_req;
     struct task_struct *task;
     int i;
-
     if (!req) return -EINVAL;
     
     task = pid_task(find_vpid(req->pid), PIDTYPE_PID);
@@ -299,13 +279,30 @@ int wuwa_install_perf_hbp(void *raw_req)
 
     for (i = 0; i < req->hook_count; i++) {
         modify_page_uxn_safe(task, req->hooks[i].vaddr, true);
-        pr_info("[Stealth] UXN set on 0x%llx\n", req->hooks[i].vaddr);
+        wuwa_info("[Stealth] UXN set on 0x%llx\n", req->hooks[i].vaddr);
     }
     return 0;
 }
-EXPORT_SYMBOL(wuwa_install_perf_hbp);
 
-/* 初始化引擎（供 src/core/wuwa.c 调用） */
+void wuwa_cleanup_stealth(void)
+{
+    struct task_struct *task;
+    int i;
+    
+    write_lock(&g_engine_lock);
+    if (g_current_req.pid != 0) {
+        task = pid_task(find_vpid(g_current_req.pid), PIDTYPE_PID);
+        if (task && task->mm) {
+            for (i = 0; i < g_current_req.hook_count; i++) {
+                modify_page_uxn_safe(task, g_current_req.hooks[i].vaddr, false);
+            }
+        }
+        g_current_req.pid = 0;
+    }
+    write_unlock(&g_engine_lock);
+    wuwa_info("[Stealth] Cleaned up PTE UXN hooks.\n");
+}
+
 int wuwa_stealth_init(void)
 {
     int ret;
@@ -318,19 +315,16 @@ int wuwa_stealth_init(void)
     ret |= register_kprobe(&kp_brk_handler);
 
     if (ret < 0) {
-        pr_err("[Stealth] Kprobe init failed.\n");
+        wuwa_err("[Stealth] Kprobe init failed.\n");
         return ret;
     }
-    pr_info("[Stealth] OOL UXN Engine Core initialized.\n");
+    wuwa_info("[Stealth] OOL UXN Engine Core initialized.\n");
     return 0;
 }
-EXPORT_SYMBOL(wuwa_stealth_init);
 
-/* 清理引擎（供 src/core/wuwa.c 调用） */
 void wuwa_stealth_cleanup(void)
 {
+    wuwa_cleanup_stealth();
     unregister_kprobe(&kp_mem_abort);
     unregister_kprobe(&kp_brk_handler);
-    pr_info("[Stealth] Engine Unloaded.\n");
 }
-EXPORT_SYMBOL(wuwa_stealth_cleanup);
