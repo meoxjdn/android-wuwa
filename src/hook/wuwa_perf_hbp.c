@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * wuwa_perf_hbp.c — PTE UXN 引擎 (浴火重生版)
+ * wuwa_perf_hbp.c — PTE UXN 引擎 (浴火重生版 - 修复编译缺失)
  * 架构：Kprobe 哑弹劫持 + AOT 预编译跳板 + 裸写 PTE
  */
 
@@ -21,6 +21,8 @@
 
 #define PTE_UXN_BIT   (1ULL << 54)
 #define BRK_MAGIC_IMM 0x1337
+/* 补全缺失的 BRK 指令机器码构造宏 */
+#define BRK_MAGIC_INST (0xD4200000 | (BRK_MAGIC_IMM << 5))
 #define OOL_SLOT_SIZE 64
 
 /* 全局配置 (由于只有一个目标游戏，精简为读写锁保护即可) */
@@ -250,6 +252,9 @@ int wuwa_stealth_init(void)
     int ret;
     
     fn_copy_from_user_nofault = (void *)kallsyms_lookup_name_ex("copy_from_user_nofault");
+    if (!fn_copy_from_user_nofault) {
+        fn_copy_from_user_nofault = (void *)kallsyms_lookup_name_ex("probe_kernel_read");
+    }
     
     kp_mem_abort.symbol_name = "do_mem_abort";
     kp_mem_abort.pre_handler = pre_do_mem_abort;
