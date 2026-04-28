@@ -1,57 +1,45 @@
+/* wuwa_perf_hbp.h */
 #ifndef WUWA_PERF_HBP_H
 #define WUWA_PERF_HBP_H
 
 #include <linux/types.h>
 
-#define MAX_HOOKS 16
-#define MAX_OOL_SLOTS 256
-
-/* PTE UXN 控制流去向枚举 */
-#define PC_BEHAVIOR_NONE  0
-#define PC_BEHAVIOR_SKIP  1
-#define PC_BEHAVIOR_RET   2
-#define PC_BEHAVIOR_JUMP  3
-
-#pragma pack(push, 8)
-struct hook_request {
-    uint64_t vaddr;
-    uint32_t original_inst; 
-    
-    uint32_t modify_x_idx;
-    uint64_t modify_x_val;
-    uint32_t modify_s_idx;
-    uint32_t modify_s_val;
-    uint32_t add_sp_val;
-    
-    uint32_t pc_behavior;
-    uint64_t pc_jump_addr;
-    
-    uint32_t use_cond;
-    uint32_t cond_base_reg;
-    uint32_t cond_offset;
-    uint32_t cond_cmp_val;
-    
-    uint32_t false_x0_modify;
-    uint64_t false_x0_val;
-    uint32_t false_add_sp;
-    uint32_t false_pc_behavior;
+/* V18 影子内存补丁动作定义 */
+enum shadow_action_v18 {
+    SHADOW_DATA_PATCH = 0, /* 修改常量/数据 (全屏 4.3f) */
+    SHADOW_RET_ONLY   = 1, /* 函数入口直接返回 (去黑边) */
+    SHADOW_JUMP_B     = 2, /* 近距离 B 跳转 (秒过) */
+    SHADOW_STUB_IF    = 3, /* 条件分支存根 (无敌判断) */
+    SHADOW_HP_SET     = 4  /* 赋值并返回 (血量修改) */
 };
 
-/* 适配 IOCTL 的通用 Stealth 载荷结构体 */
-struct wuwa_stealth_req {
-    int      pid;
-    uint64_t trampoline_base; // 用户态分配的 OOL RWX 跳板基址
+/* 单个 Hook 请求结构 */
+struct shadow_patch_req {
+    uint64_t offset;       /* 相对基址偏移 */
+    uint32_t action;       /* 动作类型 (shadow_action_v18) */
+    uint32_t expected;     /* 预期原始指令 (核心保险丝) */
+    uint32_t patch_val;    /* 补丁指令或数据 */
+    uint64_t target_va;    /* 跳转目标绝对地址 */
+};
+
+/* 核心 IOCTL 请求结构 */
+struct wuwa_hbp_req {
+    int      tid;
     uint32_t hook_count;
-    struct   hook_request hooks[MAX_HOOKS];
+    uint64_t base_addr;
+    struct shadow_patch_req hooks[16];
 };
-#pragma pack(pop)
 
-/* 暴露给 wuwa.c 调用的生命周期函数 */
-int wuwa_stealth_init(void);
-void wuwa_stealth_cleanup(void);
+/* 诊断查询结构 */
+struct wuwa_diag_req {
+    uint64_t va;
+    uint32_t current_inst;
+    int state;
+    int ref_count;
+};
 
-/* 暴露给 wuwa_ioctl.c 调用的载荷下发函数 */
-int wuwa_install_stealth(struct wuwa_stealth_req *req);
-void wuwa_cleanup_stealth(void);
+int  wuwa_install_perf_hbp(struct wuwa_hbp_req *req);
+int  wuwa_diag_shadow_slot(struct wuwa_diag_req *req);
+void wuwa_cleanup_perf_hbp(void);
 
-#endif // WUWA_PERF_HBP_H
+#endif /* WUWA_PERF_HBP_H */
