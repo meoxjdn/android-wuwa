@@ -298,5 +298,17 @@ err_rollback:
 
 /* 兼容原始的导出与注销 */
 int wuwa_hbp_init_device(void) { return 0; }
-void wuwa_hbp_cleanup_device(void) { /* 生命周期已交由 mmu_notifier 自动管理 */ }
+void wuwa_hbp_cleanup_device(void) { }
 void wuwa_cleanup_perf_hbp(void) { }
+
+/* ==========================================================
+ * 5. 兼容主入口 (wuwa.c) 的 SOTA 引擎初始化调用
+ * ========================================================== */
+int wuwa_stealth_init(void) {
+    /* V18 引擎采用按需初始化，此处返回 0 即可 */
+    return 0; 
+}
+
+void wuwa_stealth_cleanup(void) {
+    /* 生命周期已交由 mmu_notifier 自动管理，无需手动清理 */
+}
