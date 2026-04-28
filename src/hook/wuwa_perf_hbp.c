@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * wuwa_perf_hbp.c — V18.9 "Supercell" 旗舰生产版 (编译终极修复)
- * * 核心特性：
- * 1. 修复 Action 3 丢失：显式硬编码处理 JUMP_B 逻辑。
- * 2. 暴力同步：引入 ic ialluis 指令级全局刷新，强制所有 CPU 核心重新加载指令。
- * 3. 事务隔离：Snapshot 模式，先准备物理页，锁内只做 8 字节 PTE 修改。
- * 4. 编译修复：移除 ARM64 不支持的 32位 bpiallis 指令，纯净 AArch64 架构兼容。
+ * wuwa_perf_hbp.c — V18.10 "Full Arsenal" 全武备补齐版
+ * 修复：补齐了 Action 4 (SHADOW_STUB_IF) 的无敌存根逻辑。
+ * 保持了 V18.9 的核弹级同步和编译兼容。
  */
 
 #include <linux/version.h>
@@ -27,15 +24,13 @@
 #include "wuwa_perf_hbp.h"
 #include "../core/wuwa_common.h"
 
-/* 外部符号定义 */
 extern pmd_t *wuwa_walk_to_pmd(struct mm_struct *mm, unsigned long va);
 
-/* 全局句柄 */
 static struct proc_dir_entry *g_wuwa_proc = NULL;
 static DEFINE_XARRAY(g_shadow_xa);
 
 /* ==========================================================
- * 0. 架构级“核弹级”强制同步 (ARM64 Nuclear Sync)
+ * 0. 强制全局同步 (ARM64 Nuclear Sync)
  * ========================================================== */
 
 static inline void nuclear_sync_all_cores(struct mm_struct *mm, unsigned long va) {
@@ -47,24 +42,17 @@ static inline void nuclear_sync_all_cores(struct mm_struct *mm, unsigned long va
 #endif
     addr_val = (asid << 48) | (va >> 12);
 
-    /* 1. 强制数据同步屏障：确保前面的 PTE 写入已彻底落盘 */
     dsb(sy);
-    
-    /* 2. 精准 TLB 刷新 (vae1is): 带着 ASID 跨核心刷新翻译缓存 */
     __asm__ __volatile__ ("tlbi vae1is, %0" : : "r" (addr_val) : "memory");
-    dsb(sy); /* 等待 TLBI 广播完成 */
-
-    /* 3. 全局指令缓存作废 (ic ialluis)：强制所有核心丢弃 L1 I-Cache */
-    /* ARM64 架构下，此指令会自动引发分支预测器(Branch Predictor)的同步 */
+    dsb(sy);
+    /* 强刷 I-Cache，让所有 CPU 读新指令 */
     __asm__ __volatile__ ("ic ialluis" : : : "memory");
-    
-    /* 4. 最终系统指令屏障：清空流水线，强制下一条指令重新取指 */
     dsb(sy);
     isb();
 }
 
 /* ==========================================================
- * 1. 影子槽位生命周期管理
+ * 1. 影子生命周期管理
  * ========================================================== */
 
 struct shadow_slot {
@@ -83,42 +71,66 @@ static void __release_slot(struct shadow_slot *slot) {
 }
 
 /* ==========================================================
- * 2. 补丁构造逻辑 (严查 JUMP_B 范围)
+ * 2. 补丁构造逻辑 (补齐 Action 4)
  * ========================================================== */
 
 static int build_patch_instruction(u8 *dst_k, size_t off, struct shadow_patch_req *preq, unsigned long va) {
     if (off + 4 > PAGE_SIZE) return -EINVAL;
 
     switch (preq->action) {
-        case 0: /* SHADOW_DATA_PATCH - 如 FOV 4.5f */
+        case 0: /* SHADOW_DATA_PATCH */
             *(uint32_t *)(dst_k + off) = preq->patch_val;
-            pr_info("[wuwa] Data patch: 0x%08x applied at 0x%lx\n", preq->patch_val, va);
+            pr_info("[wuwa] Action 0 (Data) applied at 0x%lx\n", va);
             break;
 
-        case 1: /* SHADOW_RET_ONLY - 去黑边 */
+        case 1: /* SHADOW_RET_ONLY */
             *(uint32_t *)(dst_k + off) = 0xD65F03C0; 
+            pr_info("[wuwa] Action 1 (RET) applied at 0x%lx\n", va);
             break;
 
         case 2: /* SHADOW_HP_SET - 血量改 1 */
             if (off + 8 > PAGE_SIZE) return -EOVERFLOW;
-            *(uint32_t *)(dst_k + off) = 0x52800020;     /* MOV W0, #1 */
-            *(uint32_t *)(dst_k + off + 4) = 0xD65F03C0; /* RET */
+            *(uint32_t *)(dst_k + off) = 0x52800020;     
+            *(uint32_t *)(dst_k + off + 4) = 0xD65F03C0; 
+            pr_info("[wuwa] Action 2 (HP_1) applied at 0x%lx\n", va);
             break;
 
-        case 3: /* SHADOW_JUMP_B - 秒过 (关键修复) */
+        case 3: /* SHADOW_JUMP_B - 秒过 */
         {
             long j_off = (long)preq->target_va - (long)va;
-            /* 检查 B 指令跳转极限：±128MB */
             if ((preq->target_va & 3) || (j_off < -134217728LL) || (j_off > 134217724LL)) {
                 pr_err("[wuwa] B Jump target out of range! Target: 0x%llx, PC: 0x%lx\n", 
                        (unsigned long long)preq->target_va, va);
                 return -ERANGE;
             }
             *(uint32_t *)(dst_k + off) = 0x14000000 | ((j_off >> 2) & 0x03FFFFFF);
-            pr_info("[wuwa] Jump B patch: Target 0x%llx applied at 0x%lx\n", 
-                    (unsigned long long)preq->target_va, va);
+            pr_info("[wuwa] Action 3 (JUMP_B) applied at 0x%lx\n", va);
             break;
         }
+
+        case 4: /* SHADOW_STUB_IF - 无敌判断存根 (大牛最需要的) */
+        {
+            const size_t STUB_OFF = 0xF00;
+            if (STUB_OFF + 24 > PAGE_SIZE) return -EFAULT;
+            
+            uint32_t *stub = (uint32_t *)(dst_k + STUB_OFF);
+            unsigned long stub_va = (va & PAGE_MASK) + STUB_OFF;
+            
+            /* 无敌判断存根汇编: 过滤自己的伤害 */
+            stub[0] = 0xB9401C22; // LDR W2, [X1, #0x1C]
+            stub[1] = 0x7100045F; // CMP W2, #1
+            stub[2] = 0x54000040; // B.EQ +8 (跳过原始指令)
+            stub[3] = preq->expected; // 还原游戏真实指令
+            /* 跳回原函数的下一行 */
+            stub[4] = 0x14000000 | (((long)va + 4 - (long)stub_va - 16) >> 2 & 0x03FFFFFF);
+            stub[5] = 0xD65F03C0; // RET
+            
+            /* 修改入口点跳转到存根 */
+            *(uint32_t *)(dst_k + off) = 0x14000000 | (((long)stub_va - (long)va) >> 2 & 0x03FFFFFF);
+            pr_info("[wuwa] Action 4 (STUB_IF) applied at 0x%lx\n", va);
+            break;
+        }
+
         default:
             pr_err("[wuwa] UNKNOWN ACTION TYPE: %d\n", preq->action);
             return -EOPNOTSUPP;
@@ -137,7 +149,6 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     int i, ret = 0;
     struct shadow_slot **prep_slots;
 
-    /* 严格安全检查 */
     if (!req || req->hook_count == 0 || req->hook_count > 16) return -EINVAL;
 
     pid_s = find_get_pid(req->tid);
@@ -150,7 +161,7 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
     prep_slots = kcalloc(req->hook_count, sizeof(void *), GFP_KERNEL);
     if (!prep_slots) { ret = -ENOMEM; goto out_mm; }
 
-    /* --- 阶段 A：锁外静默准备 --- */
+    /* 阶段 A：静默预处理 */
     for (i = 0; i < req->hook_count; i++) {
         struct shadow_patch_req *preq = &req->hooks[i];
         unsigned long va = req->base_addr + preq->offset;
@@ -189,7 +200,7 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
         prep_slots[i]->orig_page = old_p; prep_slots[i]->shadow_page = new_p;
     }
 
-    /* --- 阶段 B：秒级写锁掉包 --- */
+    /* 阶段 B：秒级掉包与核弹刷新 */
     if (mmap_write_lock_killable(mm)) { ret = -EINTR; goto out_cleanup; }
 
     for (i = 0; i < req->hook_count; i++) {
@@ -209,17 +220,16 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req) {
             continue;
         }
 
-        /* 掉包 PTE，将 PFN 改为影子页 */
         slot->old_pte = *ptep;
         u64 val = (pte_val(*ptep) & ~(PHYS_MASK & PAGE_MASK)) | (page_to_pfn(slot->shadow_page) << PAGE_SHIFT);
         WRITE_ONCE(*(u64 *)ptep, val);
         pte_unmap_unlock(ptep, ptl);
 
-        /* ★ 核心：执行全核指令缓存同步 */
+        /* 核弹同步：所有 CPU 放弃抵抗，装载新代码 */
         nuclear_sync_all_cores(mm, slot->va);
 
         prep_slots[i] = NULL; 
-        pr_info("[wuwa] V18.9 FINAL: Swapped VA 0x%lx with PFN %lx\n", slot->va, page_to_pfn(slot->shadow_page));
+        pr_info("[wuwa] V18.10 FINAL: Swapped VA 0x%lx with PFN %lx\n", slot->va, page_to_pfn(slot->shadow_page));
     }
     mmap_write_unlock(mm);
 
@@ -261,10 +271,8 @@ int wuwa_stealth_init(void) {
 
 void wuwa_stealth_cleanup(void) {
     if (g_wuwa_proc) proc_remove(g_wuwa_proc);
-    /* 物理页随 MM 销毁回收，热卸载不回滚以保命 */
 }
 
-/* 占位符定义 */
 int wuwa_hbp_init_device(void) { return 0; }
 void wuwa_hbp_cleanup_device(void) { }
 void wuwa_cleanup_perf_hbp(void) { }
