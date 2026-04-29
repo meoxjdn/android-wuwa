@@ -98,39 +98,40 @@ static int build_patch_instruction(u8 *dst_k, size_t off, struct shadow_patch_re
             break;
         }
 
-        case 3: /* ★ SHADOW_GOD_MODE (断点实锤：X1读取 0x1C 并判 1) ★ */
+                case 3: /* ★ 彻底 1:1 复刻你的 god_sc[7] 数组逻辑 ★ */
         {
             const size_t STUB_OFF = 0xF00; 
             uint32_t *stub = (uint32_t *)(dst_k + STUB_OFF);
-            unsigned long s_va = (va & PAGE_MASK) + STUB_OFF;
             
-            /* 指令数为 8 条，边界校验 32 字节 */
-            if (STUB_OFF + 32 > PAGE_SIZE) {
-                pr_err("[wuwa] Action 3 God Mode stub out of bounds!\n");
+            /* 还原你的变量名，绝对严丝合缝 */
+            unsigned long cave = (va & PAGE_MASK) + STUB_OFF; 
+            unsigned long god = va;
+            
+            if (STUB_OFF + 28 > PAGE_SIZE) {
+                pr_err("[wuwa] Action 3 out of bounds!\n");
                 return -EFAULT;
             }
 
-            /* 严格重构：使用 X1，读取 0x1C，判断是否为 1 (敌人) */
-            stub[0] = 0xB40000C1;     /* 0: CBZ X1, +24  (若X1为空，跳到[6]原指令防崩) */
-            stub[1] = 0xB9401C30;     /* 4: LDR W16, [X1, #0x1C] (读取 X1 的 TeamID) */
-            stub[2] = 0x7100061F;     /* 8: CMP W16, #1  (比较是否为 1 敌人) */
-            stub[3] = 0x54000060;     /* C: B.EQ +12     (如果是 1 敌人，跳到[6]原指令去挨打！) */
-            
-            stub[4] = 0x52800020;     /* 10: MOV W0, #1  (否则是玩家，赋无敌开关 1) */
-            stub[5] = 0xD65F03C0;     /* 14: RET         (玩家安全返回) */
-            
-            stub[6] = preq->expected; /* 18: [ORIG_INS]  原指令 */
+            /* 终极精准汇编 (严格修复寄存器): */
+            stub[0] = 0xB40000A1;     /* 0: CBZ X1, +20           (若X1为空，跳到[5]原指令) */
+            stub[1] = 0xB9401C30;     /* 4: LDR W16, [X1, #0x1C]  (读取TeamID) */
+            stub[2] = 0x35000070;     /* 8: CBNZ W16, +12         (若不是0敌人，跳到[5]原指令) */
+            stub[3] = 0x52800020;     /* C: MOV W0, #1            (若是0玩家，锁定伤害为1) */
+            stub[4] = 0xD65F03C0;     /* 10: RET                  (玩家受击直接返回) */
+            stub[5] = preq->expected; /* 14: [ORIG_INS]           (即你的 orig) */
 
-            /* 1C: B GOD+4 (敌人挨打完，跳回游戏主逻辑流) */
-            long j_back = ((long)va + 4) - ((long)s_va + 28);
-            stub[7] = 0x14000000 | ((j_back >> 2) & 0x03FFFFFF);
+            /* 18: B GOD+4 -> 完全对应你的 make_b(cave + 24, god + 4) */
+            long j_back = (god + 4) - (cave + 24);
+            stub[6] = 0x14000000 | ((j_back >> 2) & 0x03FFFFFF);
 
-            /* 在触发点写入飞往 0xF00 蹦床的 B 指令 */
-            *(uint32_t *)(dst_k + off) = 0x14000000 | (((long)s_va - (long)va) >> 2 & 0x03FFFFFF);
+            /* 跳向蹦床 -> 完全对应你的 make_b(god, cave) */
+            long j_go = cave - god;
+            *(uint32_t *)(dst_k + off) = 0x14000000 | ((j_go >> 2) & 0x03FFFFFF);
             
-            pr_info("[wuwa] Action 3 (God Mode X1+CMP=1) deployed perfectly at 0x%lx\n", va);
+            pr_info("[wuwa] Action 3 deployed strictly using your god_sc array at 0x%lx\n", va);
             break;
         }
+
 
         case 4: /* SHADOW_DOUBLE_PATCH (去黑边双指令) */
             if (off + 8 > PAGE_SIZE) {
