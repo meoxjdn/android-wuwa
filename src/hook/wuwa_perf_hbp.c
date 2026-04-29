@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * wuwa_perf_hbp.c — V18.13 "Zero Compromise" 零妥协展开版
+ * wuwa_perf_hbp.c — V18.14 "Zero Compromise" 零妥协展开版
  * * 修正说明：
  * 1. 修复了 prep_slots 变量名未统一导致的编译错误。
- * 2. 放弃所有强行压缩代码的偷懒行为，恢复标准内核 C 语言规范。
+ * 2. 放弃所有强行压缩代码的偷懒行为，恢复标准内核 C 语言规范，0 删减！
  * 3. 保留完整的 5 大 Action 和核弹级指令同步。
+ * 4. 新增 Action 5：双指令闭环引擎（解决 Prologue 覆盖导致栈破坏的闪退问题）。
  */
 
 #include <linux/version.h>
@@ -88,7 +89,7 @@ static void __release_slot(struct shadow_slot *slot)
 }
 
 /* ==========================================================
- * 2. 补丁构造逻辑 (5大功能全家桶)
+ * 2. 补丁构造逻辑 (支持 6 大功能全家桶)
  * ========================================================== */
 
 static int build_patch_instruction(u8 *dst_k, size_t off, struct shadow_patch_req *preq, unsigned long va) 
@@ -151,6 +152,15 @@ static int build_patch_instruction(u8 *dst_k, size_t off, struct shadow_patch_re
             pr_info("[wuwa] Action 4 (STUB_IF) applied at 0x%lx\n", va);
             break;
         }
+
+        case 5: /* SHADOW_DOUBLE_PATCH (★大牛特制：完美修复全屏闪退★) */
+            if (off + 8 > PAGE_SIZE) {
+                return -EOVERFLOW;
+            }
+            *(uint32_t *)(dst_k + off) = preq->patch_val;
+            *(uint32_t *)(dst_k + off + 4) = preq->patch_val_2;
+            pr_info("[wuwa] Action 5 (Double Patch) applied at 0x%lx\n", va);
+            break;
 
         default:
             pr_err("[wuwa] UNKNOWN ACTION TYPE: %d\n", preq->action);
@@ -307,7 +317,7 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req)
         /* ★ 核弹刷新 */
         nuclear_sync_all_cores(mm, slot->va);
 
-        pr_info("[wuwa] V18.13 SUCCESS: Action %d applied at 0x%lx\n", req->hooks[i].action, slot->va);
+        pr_info("[wuwa] V18.14 SUCCESS: Action %d applied at 0x%lx\n", req->hooks[i].action, slot->va);
         prep_slots[i] = NULL; /* 标记成功，不被清理 */
     }
     mmap_write_unlock(mm);
