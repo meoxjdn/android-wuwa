@@ -3,17 +3,15 @@
 
 #include <linux/types.h>
 
-/* V18.17 影子内存补丁动作定义 */
+/* V18.18 影子内存补丁动作定义 (大牛清洗纯净版) */
 enum shadow_action_v18 {
     SHADOW_DATA_PATCH   = 0,
     SHADOW_RET_ONLY     = 1,
-    SHADOW_JUMP_B       = 2,
-    SHADOW_STUB_IF      = 3,
-    SHADOW_HP_SET       = 4,
-    SHADOW_DOUBLE_PATCH = 5,
-    SHADOW_SAFE_HP_STUB = 6, 
-    SHADOW_FLOAT_RET    = 7,
-    SHADOW_GOD_MODE_STUB= 8  /* ★ V18.17 终极无敌跳板引擎 (大牛定制版) */
+    SHADOW_JUMP_B       = 2, /* 秒过 */
+    SHADOW_GOD_MODE     = 3, /* ★ 你的终极精准无敌汇编 (替代了所有旧逻辑) */
+    SHADOW_DOUBLE_PATCH = 4, /* 去黑边双指令 */
+    SHADOW_SAFE_HP_STUB = 5, /* 秒杀防越界蹦床 */
+    SHADOW_FLOAT_RET    = 6  /* 全屏浮点引擎 */
 };
 
 struct shadow_patch_req {
