@@ -98,35 +98,40 @@ static int build_patch_instruction(u8 *dst_k, size_t off, struct shadow_patch_re
             break;
         }
 
-        case 3: /* ★ SHADOW_GOD_MODE (修正 IL2CPP this 指针为 X0 版) ★ */
+                case 3: /* ★ SHADOW_GOD_MODE (大牛终极修正：X0实体指针 + 判1逻辑) ★ */
         {
             const size_t STUB_OFF = 0xF00; 
             uint32_t *stub = (uint32_t *)(dst_k + STUB_OFF);
             unsigned long s_va = (va & PAGE_MASK) + STUB_OFF;
             
-            if (STUB_OFF + 28 > PAGE_SIZE) {
+            /* 引入 CMP 指令，总指令数为 8 条，校验边界改为 32 字节 */
+            if (STUB_OFF + 32 > PAGE_SIZE) {
                 pr_err("[wuwa] Action 3 God Mode stub out of bounds!\n");
                 return -EFAULT;
             }
 
-            /* 修正版汇编：锁定 X0 作为 this 指针进行读取！ */
-            stub[0] = 0xB40000A0;     /* 0: CBZ X0, +20 (若X0对象为空，跳到原指令) */
-            stub[1] = 0xB9401C10;     /* 4: LDR W16, [X0, #0x1C] (从X0正确读取TeamID) */
-            stub[2] = 0x35000070;     /* 8: CBNZ W16, +12 (若TeamID非0，跳到原指令扣血) */
-            stub[3] = 0x52800020;     /* C: MOV W0, #1 (玩家TeamID=0，锁定伤害为1) */
-            stub[4] = 0xD65F03C0;     /* 10: RET (玩家安全返回) */
-            stub[5] = preq->expected; /* 14: [ORIG_INS] 原指令 */
+            /* 严格重构：读取 X0(实体) 的 0x1C，判断是否为 1(敌人) */
+            stub[0] = 0xB40000C0;     /* 0: CBZ X0, +24  (若X0为空，跳到[6]原指令防崩) */
+            stub[1] = 0xB9401C10;     /* 4: LDR W16, [X0, #0x1C] (精准从实体读取TeamID) */
+            stub[2] = 0x7100061F;     /* 8: CMP W16, #1  (判断TeamID是否等于 1 敌人) */
+            stub[3] = 0x54000060;     /* C: B.EQ +12     (如果是 1 敌人，跳到[6]原指令挨打！) */
+            
+            stub[4] = 0x52800020;     /* 10: MOV W0, #1  (否则是玩家，赋予原生无敌开关) */
+            stub[5] = 0xD65F03C0;     /* 14: RET         (玩家安全返回，不走原逻辑) */
+            
+            stub[6] = preq->expected; /* 18: [ORIG_INS]  原受击指令 */
 
-            /* 18: B GOD+4 (跳回主逻辑流) */
-            long j_back = ((long)va + 4) - ((long)s_va + 24);
-            stub[6] = 0x14000000 | ((j_back >> 2) & 0x03FFFFFF);
+            /* 1C: B GOD+4 (敌人执行完原指令后，跳回游戏主逻辑流) */
+            long j_back = ((long)va + 4) - ((long)s_va + 28);
+            stub[7] = 0x14000000 | ((j_back >> 2) & 0x03FFFFFF);
 
             /* 在触发点写入飞往蹦床的 B 指令 */
             *(uint32_t *)(dst_k + off) = 0x14000000 | (((long)s_va - (long)va) >> 2 & 0x03FFFFFF);
             
-            pr_info("[wuwa] Action 3 (God Mode Team=0) deployed perfectly at 0x%lx\n", va);
+            pr_info("[wuwa] Action 3 (God Mode X0+CMP=1) deployed perfectly at 0x%lx\n", va);
             break;
         }
+
 
         case 4: /* SHADOW_DOUBLE_PATCH (去黑边双指令) */
             if (off + 8 > PAGE_SIZE) {
