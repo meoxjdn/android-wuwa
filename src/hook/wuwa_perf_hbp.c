@@ -98,33 +98,35 @@ static int build_patch_instruction(u8 *dst_k, size_t off, struct shadow_patch_re
             break;
         }
 
-        case 3: /* ★ SHADOW_GOD_MODE (用户的终极精准汇编) ★ */
+        case 3: /* ★ SHADOW_GOD_MODE (用户的终极精准汇编 - TeamID == 1 版) ★ */
         {
             const size_t STUB_OFF = 0xF00; 
             uint32_t *stub = (uint32_t *)(dst_k + STUB_OFF);
             unsigned long s_va = (va & PAGE_MASK) + STUB_OFF;
             
-            if (STUB_OFF + 28 > PAGE_SIZE) {
+            /* 注意：引入 CMP 后增加了一条指令，这里修正边界校验为 32 字节 */
+            if (STUB_OFF + 32 > PAGE_SIZE) {
                 pr_err("[wuwa] Action 3 God Mode stub out of bounds!\n");
                 return -EFAULT;
             }
 
-            /* 严丝合缝对齐你的 god_sc[7] 数组逻辑 */
-            stub[0] = 0xB40000A1;     /* 0: CBZ X1, +20 (若X1为空，跳到[5]原指令) */
+            /* 严格重构：判断 X1+0x1C 是否等于 1 */
+            stub[0] = 0xB40000C1;     /* 0: CBZ X1, +24 (若X1为空，跳过业务，前往 stub[6] 执行原指令) */
             stub[1] = 0xB9401C30;     /* 4: LDR W16, [X1, #0x1C] (读取TeamID) */
-            stub[2] = 0x35000070;     /* 8: CBNZ W16, +12 (若不是0敌人，跳到[5]原指令) */
-            stub[3] = 0x52800020;     /* C: MOV W0, #1 (若是0玩家，锁定伤害为1) */
-            stub[4] = 0xD65F03C0;     /* 10: RET (玩家受击直接返回) */
-            stub[5] = preq->expected; /* 14: [ORIG_INS] 原指令 */
+            stub[2] = 0x7100061F;     /* 8: CMP W16, #1 (比较 TeamID 是否为 1) */
+            stub[3] = 0x54000061;     /* C: B.NE +12 (如果不等于 1，跳前往 stub[6] 执行原指令) */
+            stub[4] = 0x52800020;     /* 10: MOV W0, #1 (如果等于 1，说明是玩家，锁定伤害为 1) */
+            stub[5] = 0xD65F03C0;     /* 14: RET (玩家受击直接返回，保护完毕) */
+            stub[6] = preq->expected; /* 18: [ORIG_INS] 原指令 */
 
-            /* 18: B GOD+4 (跳回主逻辑流) */
-            long j_back = ((long)va + 4) - ((long)s_va + 24);
-            stub[6] = 0x14000000 | ((j_back >> 2) & 0x03FFFFFF);
+            /* 1C: B GOD+4 (执行完原指令后，跳回游戏主逻辑流) */
+            long j_back = ((long)va + 4) - ((long)s_va + 28);
+            stub[7] = 0x14000000 | ((j_back >> 2) & 0x03FFFFFF);
 
-            /* 在原地址写入飞往蹦床的 B 指令 */
+            /* 在触发点写入飞往 0xF00 蹦床的 B 指令 */
             *(uint32_t *)(dst_k + off) = 0x14000000 | (((long)s_va - (long)va) >> 2 & 0x03FFFFFF);
             
-            pr_info("[wuwa] Action 3 (Ultimate God Mode) deployed perfectly at 0x%lx\n", va);
+            pr_info("[wuwa] Action 3 (God Mode Team=1) deployed perfectly at 0x%lx\n", va);
             break;
         }
 
