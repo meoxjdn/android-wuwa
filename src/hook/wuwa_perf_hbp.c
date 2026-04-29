@@ -98,7 +98,7 @@ static int build_patch_instruction(u8 *dst_k, size_t off, struct shadow_patch_re
             break;
         }
 
-        case 3: /* ★ SHADOW_GOD_MODE (恢复原汁原味 TeamID == 0 锁血版) ★ */
+        case 3: /* ★ SHADOW_GOD_MODE (修正 IL2CPP this 指针为 X0 版) ★ */
         {
             const size_t STUB_OFF = 0xF00; 
             uint32_t *stub = (uint32_t *)(dst_k + STUB_OFF);
@@ -109,12 +109,12 @@ static int build_patch_instruction(u8 *dst_k, size_t off, struct shadow_patch_re
                 return -EFAULT;
             }
 
-            /* 严丝合缝对齐你的 god_sc[7] 数组逻辑：玩家是0，敌人是1 */
-            stub[0] = 0xB40000A1;     /* 0: CBZ X1, +20 (若X1为空，跳到[5]原指令) */
-            stub[1] = 0xB9401C30;     /* 4: LDR W16, [X1, #0x1C] (读取TeamID) */
-            stub[2] = 0x35000070;     /* 8: CBNZ W16, +12 (若不是0敌人，跳到[5]原指令) */
-            stub[3] = 0x52800020;     /* C: MOV W0, #1 (若是0玩家，锁定伤害为1) */
-            stub[4] = 0xD65F03C0;     /* 10: RET (玩家受击直接返回) */
+            /* 修正版汇编：锁定 X0 作为 this 指针进行读取！ */
+            stub[0] = 0xB40000A0;     /* 0: CBZ X0, +20 (若X0对象为空，跳到原指令) */
+            stub[1] = 0xB9401C10;     /* 4: LDR W16, [X0, #0x1C] (从X0正确读取TeamID) */
+            stub[2] = 0x35000070;     /* 8: CBNZ W16, +12 (若TeamID非0，跳到原指令扣血) */
+            stub[3] = 0x52800020;     /* C: MOV W0, #1 (玩家TeamID=0，锁定伤害为1) */
+            stub[4] = 0xD65F03C0;     /* 10: RET (玩家安全返回) */
             stub[5] = preq->expected; /* 14: [ORIG_INS] 原指令 */
 
             /* 18: B GOD+4 (跳回主逻辑流) */
