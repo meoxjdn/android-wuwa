@@ -190,13 +190,13 @@ static int build_patch_instruction(u8 *dst_k, size_t off, struct shadow_patch_re
                 return -EFAULT;
             }
 
-            /* 大牛特制汇编级降维打击 */
+            /* 严格对齐你提供的汇编级降维打击 */
             stub[0] = 0xB40000A1;     /* CBZ X1, +20 (若X1为空，跳回原指令) */
             stub[1] = 0xB9401C30;     /* LDR W16, [X1, #0x1C] (读取TeamID) */
-            stub[2] = 0x35000070;     /* CBNZ W16, +12 (若不是玩家，跳回原指令) */
+            stub[2] = 0x35000070;     /* CBNZ W16, +12 (若不是敌人，跳回原指令) */
             stub[3] = 0x52800020;     /* MOV W0, #1 (锁定伤害为1) */
-            stub[4] = 0xD65F03C0;     /* RET (玩家受击直接返回) */
-            stub[5] = preq->expected; /* 原指令备份 */
+            stub[4] = 0xD65F03C0;     /* RET (玩家受击直接返回，由于在分配栈之前返回，堆栈完美平衡) */
+            stub[5] = preq->expected; /* 原指令备份，即你传的 0xA9BD5BF7 */
 
             /* 构造跳回原执行流的 B 跳转 */
             long j_back = ((long)va + 4) - ((long)s_va + 24);
@@ -286,6 +286,7 @@ int wuwa_install_perf_hbp(struct wuwa_hbp_req *req)
         }
 
         src_k = kmap_local_page(old_p);
+        /* 核心拦截：如果原内存数据与 control.c 传来的 expected 不符，抛弃并报警！ */
         if (*(uint32_t *)(src_k + off) != preq->expected) {
             pr_emerg("[wuwa] CRITICAL Mismatch at 0x%lx: Exp %08x, Got %08x\n", 
                      va, preq->expected, *(uint32_t *)(src_k + off));
@@ -428,7 +429,6 @@ void wuwa_stealth_cleanup(void)
     }
 }
 
-/* ★ 占位符定义全数保留 ★ */
 void wuwa_cleanup_all_shadows(void) {}
 int wuwa_hbp_init_device(void) { return 0; }
 void wuwa_hbp_cleanup_device(void) {}
