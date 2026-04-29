@@ -98,40 +98,39 @@ static int build_patch_instruction(u8 *dst_k, size_t off, struct shadow_patch_re
             break;
         }
 
-                case 3: /* ★ SHADOW_GOD_MODE (大牛终极修正：X0实体指针 + 判1逻辑) ★ */
+        case 3: /* ★ SHADOW_GOD_MODE (断点实锤：X1读取 0x1C 并判 1) ★ */
         {
             const size_t STUB_OFF = 0xF00; 
             uint32_t *stub = (uint32_t *)(dst_k + STUB_OFF);
             unsigned long s_va = (va & PAGE_MASK) + STUB_OFF;
             
-            /* 引入 CMP 指令，总指令数为 8 条，校验边界改为 32 字节 */
+            /* 指令数为 8 条，边界校验 32 字节 */
             if (STUB_OFF + 32 > PAGE_SIZE) {
                 pr_err("[wuwa] Action 3 God Mode stub out of bounds!\n");
                 return -EFAULT;
             }
 
-            /* 严格重构：读取 X0(实体) 的 0x1C，判断是否为 1(敌人) */
-            stub[0] = 0xB40000C0;     /* 0: CBZ X0, +24  (若X0为空，跳到[6]原指令防崩) */
-            stub[1] = 0xB9401C10;     /* 4: LDR W16, [X0, #0x1C] (精准从实体读取TeamID) */
-            stub[2] = 0x7100061F;     /* 8: CMP W16, #1  (判断TeamID是否等于 1 敌人) */
-            stub[3] = 0x54000060;     /* C: B.EQ +12     (如果是 1 敌人，跳到[6]原指令挨打！) */
+            /* 严格重构：使用 X1，读取 0x1C，判断是否为 1 (敌人) */
+            stub[0] = 0xB40000C1;     /* 0: CBZ X1, +24  (若X1为空，跳到[6]原指令防崩) */
+            stub[1] = 0xB9401C30;     /* 4: LDR W16, [X1, #0x1C] (读取 X1 的 TeamID) */
+            stub[2] = 0x7100061F;     /* 8: CMP W16, #1  (比较是否为 1 敌人) */
+            stub[3] = 0x54000060;     /* C: B.EQ +12     (如果是 1 敌人，跳到[6]原指令去挨打！) */
             
-            stub[4] = 0x52800020;     /* 10: MOV W0, #1  (否则是玩家，赋予原生无敌开关) */
-            stub[5] = 0xD65F03C0;     /* 14: RET         (玩家安全返回，不走原逻辑) */
+            stub[4] = 0x52800020;     /* 10: MOV W0, #1  (否则是玩家，赋无敌开关 1) */
+            stub[5] = 0xD65F03C0;     /* 14: RET         (玩家安全返回) */
             
-            stub[6] = preq->expected; /* 18: [ORIG_INS]  原受击指令 */
+            stub[6] = preq->expected; /* 18: [ORIG_INS]  原指令 */
 
-            /* 1C: B GOD+4 (敌人执行完原指令后，跳回游戏主逻辑流) */
+            /* 1C: B GOD+4 (敌人挨打完，跳回游戏主逻辑流) */
             long j_back = ((long)va + 4) - ((long)s_va + 28);
             stub[7] = 0x14000000 | ((j_back >> 2) & 0x03FFFFFF);
 
-            /* 在触发点写入飞往蹦床的 B 指令 */
+            /* 在触发点写入飞往 0xF00 蹦床的 B 指令 */
             *(uint32_t *)(dst_k + off) = 0x14000000 | (((long)s_va - (long)va) >> 2 & 0x03FFFFFF);
             
-            pr_info("[wuwa] Action 3 (God Mode X0+CMP=1) deployed perfectly at 0x%lx\n", va);
+            pr_info("[wuwa] Action 3 (God Mode X1+CMP=1) deployed perfectly at 0x%lx\n", va);
             break;
         }
-
 
         case 4: /* SHADOW_DOUBLE_PATCH (去黑边双指令) */
             if (off + 8 > PAGE_SIZE) {
