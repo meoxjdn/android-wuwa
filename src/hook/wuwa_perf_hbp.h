@@ -3,7 +3,7 @@
 
 #include <linux/types.h>
 
-/* V18.16 影子内存补丁动作定义 */
+/* V18.17 影子内存补丁动作定义 */
 enum shadow_action_v18 {
     SHADOW_DATA_PATCH   = 0,
     SHADOW_RET_ONLY     = 1,
@@ -12,7 +12,8 @@ enum shadow_action_v18 {
     SHADOW_HP_SET       = 4,
     SHADOW_DOUBLE_PATCH = 5,
     SHADOW_SAFE_HP_STUB = 6, 
-    SHADOW_FLOAT_RET    = 7  /* ★ V18.16 终极浮点返回引擎 (解决全屏非法指令闪退) */
+    SHADOW_FLOAT_RET    = 7,
+    SHADOW_GOD_MODE_STUB= 8  /* ★ V18.17 终极无敌跳板引擎 (大牛定制版) */
 };
 
 struct shadow_patch_req {
