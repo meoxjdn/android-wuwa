@@ -4,22 +4,24 @@
 
 #include <linux/types.h>
 
-/* V18 影子内存补丁动作定义 */
+/* V18.14 影子内存补丁动作定义 (大牛扩容版) */
 enum shadow_action_v18 {
-    SHADOW_DATA_PATCH = 0, /* 修改常量/数据 (全屏 4.3f) */
-    SHADOW_RET_ONLY   = 1, /* 函数入口直接返回 (去黑边) */
-    SHADOW_JUMP_B     = 2, /* 近距离 B 跳转 (秒过) */
-    SHADOW_STUB_IF    = 3, /* 条件分支存根 (无敌判断) */
-    SHADOW_HP_SET     = 4  /* 赋值并返回 (血量修改) */
+    SHADOW_DATA_PATCH   = 0, /* 修改常量/数据 (全屏 4.3f) */
+    SHADOW_RET_ONLY     = 1, /* 函数入口直接返回 (去黑边) */
+    SHADOW_JUMP_B       = 2, /* 近距离 B 跳转 (秒过) */
+    SHADOW_STUB_IF      = 3, /* 条件分支存根 (无敌判断) */
+    SHADOW_HP_SET       = 4, /* 赋值并返回 (血量修改) */
+    SHADOW_DOUBLE_PATCH = 5  /* ★ 新增：双指令闭环引擎 (解决栈平衡崩坏) */
 };
 
-/* 单个 Hook 请求结构 */
+/* 单个 Hook 请求结构 (完美 32 字节对齐) */
 struct shadow_patch_req {
-    uint64_t offset;       /* 相对基址偏移 */
-    uint32_t action;       /* 动作类型 (shadow_action_v18) */
-    uint32_t expected;     /* 预期原始指令 (核心保险丝) */
-    uint32_t patch_val;    /* 补丁指令或数据 */
-    uint64_t target_va;    /* 跳转目标绝对地址 */
+    uint64_t offset;       /* 相对基址偏移 (8 bytes) */
+    uint32_t action;       /* 动作类型 (shadow_action_v18) (4 bytes) */
+    uint32_t expected;     /* 预期原始指令 (核心保险丝) (4 bytes) */
+    uint32_t patch_val;    /* 补丁指令或数据 1 (4 bytes) */
+    uint32_t patch_val_2;  /* ★ 修复编译报错：补丁指令 2 (4 bytes) */
+    uint64_t target_va;    /* 跳转目标绝对地址 (8 bytes) */
 };
 
 /* 核心 IOCTL 请求结构 */
