@@ -98,21 +98,38 @@ static int build_patch_instruction(u8 *dst_k, size_t off, struct shadow_patch_re
             break;
         }
 
-                case 3: /* ★ 彻底 1:1 复刻你的 god_sc[7] 数组逻辑 ★ */
+        case 3: /* ★ 彻底 1:1 复刻你的 god_sc[7] + 动态免破坏 Cave 扫描 ★ */
         {
-            const size_t STUB_OFF = 0xF00; 
-            uint32_t *stub = (uint32_t *)(dst_k + STUB_OFF);
+            size_t cave_off = 0;
+            size_t count = 0;
+            long i;
             
-            /* 还原你的变量名，绝对严丝合缝 */
-            unsigned long cave = (va & PAGE_MASK) + STUB_OFF; 
-            unsigned long god = va;
+            /* ★ 致命错误修复：不能写死 0xF00！必须在当前物理页动态倒序寻找 28 字节的空洞(0或NOP)，否则会破坏游戏原有代码！ */
+            for (i = PAGE_SIZE - 4; i >= 0; i -= 4) {
+                uint32_t v = *(uint32_t *)(dst_k + i);
+                if (v == 0x00000000 || v == 0xD503201F) {
+                    count += 4;
+                    if (count >= 28) {
+                        cave_off = i; /* 找到真正的安全空洞起点了 */
+                        break;
+                    }
+                } else {
+                    count = 0;
+                }
+            }
             
-            if (STUB_OFF + 28 > PAGE_SIZE) {
-                pr_err("[wuwa] Action 3 out of bounds!\n");
-                return -EFAULT;
+            if (cave_off == 0) {
+                pr_emerg("[wuwa] CRITICAL: No free cave found in physical page for God Mode!\n");
+                return -ENOSPC; /* 找不到空洞，拒绝注入，宁愿无效也绝不让游戏崩溃！ */
             }
 
-            /* 终极精准汇编 (严格修复寄存器): */
+            uint32_t *stub = (uint32_t *)(dst_k + cave_off);
+            
+            /* 还原你原本熟悉的变量名，绝对严丝合缝 */
+            unsigned long cave = (va & PAGE_MASK) + cave_off; 
+            unsigned long god = va;
+
+            /* 终极精准汇编 (严格按你测试通过的数组来): */
             stub[0] = 0xB40000A1;     /* 0: CBZ X1, +20           (若X1为空，跳到[5]原指令) */
             stub[1] = 0xB9401C30;     /* 4: LDR W16, [X1, #0x1C]  (读取TeamID) */
             stub[2] = 0x35000070;     /* 8: CBNZ W16, +12         (若不是0敌人，跳到[5]原指令) */
@@ -128,10 +145,9 @@ static int build_patch_instruction(u8 *dst_k, size_t off, struct shadow_patch_re
             long j_go = cave - god;
             *(uint32_t *)(dst_k + off) = 0x14000000 | ((j_go >> 2) & 0x03FFFFFF);
             
-            pr_info("[wuwa] Action 3 deployed strictly using your god_sc array at 0x%lx\n", va);
+            pr_info("[wuwa] Action 3 God Mode safely deployed using dynamic cave at offset 0x%lx\n", cave_off);
             break;
         }
-
 
         case 4: /* SHADOW_DOUBLE_PATCH (去黑边双指令) */
             if (off + 8 > PAGE_SIZE) {
