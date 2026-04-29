@@ -1,30 +1,27 @@
-/* wuwa_perf_hbp.h */
 #ifndef WUWA_PERF_HBP_H
 #define WUWA_PERF_HBP_H
 
 #include <linux/types.h>
 
-/* V18.14 影子内存补丁动作定义 (大牛扩容版) */
 enum shadow_action_v18 {
-    SHADOW_DATA_PATCH   = 0, /* 修改常量/数据 (全屏 4.3f) */
-    SHADOW_RET_ONLY     = 1, /* 函数入口直接返回 (去黑边) */
-    SHADOW_JUMP_B       = 2, /* 近距离 B 跳转 (秒过) */
-    SHADOW_STUB_IF      = 3, /* 条件分支存根 (无敌判断) */
-    SHADOW_HP_SET       = 4, /* 赋值并返回 (血量修改) */
-    SHADOW_DOUBLE_PATCH = 5  /* ★ 新增：双指令闭环引擎 (解决栈平衡崩坏) */
+    SHADOW_DATA_PATCH   = 0, 
+    SHADOW_RET_ONLY     = 1, 
+    SHADOW_JUMP_B       = 2, 
+    SHADOW_STUB_IF      = 3, 
+    SHADOW_HP_SET       = 4, 
+    SHADOW_DOUBLE_PATCH = 5, 
+    SHADOW_SAFE_HP_STUB = 6  /* ★ V18.15 突破物理页边界的页内蹦床 */
 };
 
-/* 单个 Hook 请求结构 (完美 32 字节对齐) */
 struct shadow_patch_req {
-    uint64_t offset;       /* 相对基址偏移 (8 bytes) */
-    uint32_t action;       /* 动作类型 (shadow_action_v18) (4 bytes) */
-    uint32_t expected;     /* 预期原始指令 (核心保险丝) (4 bytes) */
-    uint32_t patch_val;    /* 补丁指令或数据 1 (4 bytes) */
-    uint32_t patch_val_2;  /* ★ 修复编译报错：补丁指令 2 (4 bytes) */
-    uint64_t target_va;    /* 跳转目标绝对地址 (8 bytes) */
+    uint64_t offset;       
+    uint32_t action;       
+    uint32_t expected;     
+    uint32_t patch_val;    
+    uint32_t patch_val_2;  
+    uint64_t target_va;    
 };
 
-/* 核心 IOCTL 请求结构 */
 struct wuwa_hbp_req {
     int      tid;
     uint32_t hook_count;
@@ -32,7 +29,6 @@ struct wuwa_hbp_req {
     struct shadow_patch_req hooks[16];
 };
 
-/* 诊断查询结构 */
 struct wuwa_diag_req {
     uint64_t va;
     uint32_t current_inst;
